@@ -1,82 +1,100 @@
-function cleanCandidate(candidate) {
-  if (!candidate) return '';
-  let s = String(candidate)
-    .replace(/\\u0026/g, '&')
-    .replace(/&amp;/g, '&')
-    .replace(/\\\//g, '/')
-    .replace(/\"/g, '"')
-    .replace(/^['"`]+|['"`]+$/g, '')
-    .trim();
-
-  // Trim characters commonly attached by HTML/JS/markdown punctuation.
-  s = s.replace(/[),.;\]}]+$/g, '');
-
-  if (s.startsWith('ttps://')) s = `h${s}`;
-  if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
-
-  return s;
+function repairBrokenProtocol(value = '') {
+  return String(value)
+    .replace(/^ttps:\/\//i, 'https://')
+    .replace(/^http:\/\//i, 'http://')
+    .replace(/^hhttps:\/\//i, 'https://');
 }
 
-function safeDecode(value) {
-  if (value == null) return null;
-  let v = String(value);
-  for (let i = 0; i < 3; i++) {
+function addHttpsToBareUrl(value = '') {
+  const text = String(value).trim();
+
+  if (/^https?:\/\//i.test(text)) return text;
+  if (/^\/\//.test(text)) return `https:${text}`;
+
+  if (/^[a-z0-9.-]+\.[a-z]{2,}\//i.test(text)) {
+    return `https://${text}`;
+  }
+
+  return text;
+}
+
+function cleanText(text = '') {
+  return String(text)
+    .replace(/&amp;/g, '&')
+    .replace(/\\u0026/g, '&')
+    .replace(/\\\//g, '/')
+    .replace(/%5Cu0026/gi, '%26');
+}
+
+function safeDecode(value = '') {
+  let output = String(value);
+
+  for (let i = 0; i < 4; i++) {
     try {
-      const decoded = decodeURIComponent(v);
-      if (decoded === v) break;
-      v = decoded;
-    } catch (_) {
+      const decoded = decodeURIComponent(output);
+      if (decoded === output) break;
+      output = decoded;
+    } catch {
       break;
     }
   }
-  return v;
+
+  return output;
 }
 
-function appendQueryParam(url, key, value) {
-  if (!value) return url;
-  if (new RegExp(`[?&]${key}=`).test(url)) return url;
-  return `${url}${url.includes('?') ? '&' : '?'}${key}=${value}`;
+function trimUrl(url = '') {
+  return String(url)
+    .trim()
+    .replace(/[),.;\]}]+$/g, '')
+    .replace(/^["'`]+|["'`]+$/g, '');
 }
 
-function parseProxyUrl(rawCandidate) {
-  const originalCapturedUrl = cleanCandidate(rawCandidate);
-  let parsed;
+function looksUseful(value = '') {
+  const text = safeDecode(cleanText(value)).toLowerCase();
 
-  try {
-    parsed = new URL(originalCapturedUrl);
-  } catch (_) {
-    return null;
-  }
+  return (
+    text.includes('/proxy/video?url=') ||
+    text.includes('/video?url=') ||
+    text.includes('/highscool/video?url=') ||
+    text.includes('/highschool/video?url=') ||
+    text.includes('.mp4') ||
+    text.includes('.m3u8') ||
+    text.includes('.webm') ||
+    text.includes('bcdnxw.')
+  );
+}
 
-  if (!/\/proxy\/video$/i.test(parsed.pathname)) return null;
+function getRawUrlParam(originalUrl = '') {
+  const text = cleanText(originalUrl);
 
-  let decodedVideoUrl = parsed.searchParams.get('url');
-  if (!decodedVideoUrl) return null;
-  decodedVideoUrl = safeDecode(decodedVideoUrl);
+  const match = text.match(/[?&]url=([\s\S]*?)(?=&(?:apikey|referer|origin)=|$)/i);
 
-  // If the captured URL was broken/raw, t/sign may have leaked into the outer query.
-  const leakedSign = parsed.searchParams.get('sign');
-  const leakedT = parsed.searchParams.get('t');
-  decodedVideoUrl = appendQueryParam(decodedVideoUrl, 'sign', leakedSign);
-  decodedVideoUrl = appendQueryParam(decodedVideoUrl, 't', leakedT);
+  if (!match) return null;
 
-  const apikey = safeDecode(parsed.searchParams.get('apikey'));
-  const referer = safeDecode(parsed.searchParams.get('referer'));
-  const origin = safeDecode(parsed.searchParams.get('origin'));
+  return match[1];
+}
 
-  const params = new URLSearchParams();
-  params.set('url', decodedVideoUrl);
-  if (apikey) params.set('apikey', apikey);
-  if (referer) params.set('referer', referer);
-  if (origin) params.set('origin', origin);
+function buildEncodedProxyUrl(parsedUrl, originalUrl) {
+  const rawInner = getRawUrlParam(originalUrl);
+  if (!rawInner) return null;
 
-  const workingEncodedProxyUrl = `${parsed.origin}${parsed.pathname}?${params.toString()}`;
+  let decodedVideoUrl = safeDecode(rawInner);
+  decodedVideoUrl = addHttpsToBareUrl(repairBrokenProtocol(decodedVideoUrl));
+
+  const apikey = parsedUrl.searchParams.get('apikey') || '';
+  const referer = parsedUrl.searchParams.get('referer') || '';
+  const origin = parsedUrl.searchParams.get('origin') || '';
+
+  const params = [];
+
+  params.push(`url=${encodeURIComponent(decodedVideoUrl)}`);
+
+  if (apikey) params.push(`apikey=${encodeURIComponent(apikey)}`);
+  if (referer) params.push(`referer=${encodeURIComponent(referer)}`);
+  if (origin) params.push(`origin=${encodeURIComponent(origin)}`);
 
   return {
-    type: 'proxy-video',
-    workingEncodedProxyUrl,
-    originalCapturedUrl,
-    decodedProxyUrl: safeDecode(originalCapturedUrl),
+    encodedProxyUrl: `${parsedUrl.origin}${parsedUrl.pathname}?${params.join('&')}`,
     decodedVideoUrl,
     apikey,
     referer,
@@ -84,28 +102,118 @@ function parseProxyUrl(rawCandidate) {
   };
 }
 
-function extractFirstProxyVideo(input) {
+function parseFoundUrl(input, source = 'unknown', baseUrl = '') {
   if (!input) return null;
 
-  const normalized = String(input)
-    .replace(/\\u0026/g, '&')
-    .replace(/&amp;/g, '&')
-    .replace(/\\\//g, '/')
-    .replace(/\\n/g, '\n')
-    .replace(/\\t/g, '\t');
+  let original = trimUrl(cleanText(input));
+  original = repairBrokenProtocol(original);
 
-  const regex = /(?:(?:https?:|ttps:)\/\/)?[a-z0-9.-]+(?::\d+)?\/proxy\/video\?url=[^\s"'<>`\\]+/gi;
-  const matches = normalized.match(regex) || [];
+  if (original.startsWith('//')) {
+    original = `https:${original}`;
+  }
 
-  for (const match of matches) {
-    const parsed = parseProxyUrl(match);
-    if (parsed) return parsed;
+  let urlForParsing = original;
+
+  if (/^https%3A%2F%2F/i.test(urlForParsing)) {
+    urlForParsing = safeDecode(urlForParsing);
+  }
+
+  urlForParsing = addHttpsToBareUrl(repairBrokenProtocol(urlForParsing));
+
+  let parsed;
+
+  try {
+    parsed = new URL(urlForParsing, baseUrl || undefined);
+  } catch {
+    return null;
+  }
+
+  const fullUrl = parsed.toString();
+  const lower = safeDecode(fullUrl).toLowerCase();
+
+  const isProxyVideo =
+    lower.includes('/proxy/video?url=') ||
+    lower.includes('/video?url=') ||
+    lower.includes('/highscool/video?url=') ||
+    lower.includes('/highschool/video?url=');
+
+  if (isProxyVideo) {
+    const rebuilt = buildEncodedProxyUrl(parsed, fullUrl);
+
+    if (!rebuilt) return null;
+
+    return {
+      type: 'proxy-video',
+      source,
+      url: fullUrl,
+      workingUrl: rebuilt.encodedProxyUrl,
+      encodedProxyUrl: rebuilt.encodedProxyUrl,
+      decodedVideoUrl: rebuilt.decodedVideoUrl,
+      apikey: rebuilt.apikey || null,
+      referer: rebuilt.referer || null,
+      origin: rebuilt.origin || null
+    };
+  }
+
+  const isDirectMedia =
+    lower.includes('.mp4') ||
+    lower.includes('.m3u8') ||
+    lower.includes('.webm');
+
+  if (isDirectMedia) {
+    return {
+      type: 'direct-media',
+      source,
+      url: fullUrl,
+      workingUrl: fullUrl,
+      encodedProxyUrl: null,
+      decodedVideoUrl: fullUrl,
+      apikey: null,
+      referer: null,
+      origin: null
+    };
   }
 
   return null;
 }
 
+function extractUrlsFromText(text = '', source = 'unknown', baseUrl = '') {
+  const cleaned = cleanText(text);
+  const results = [];
+  const seen = new Set();
+
+  const patterns = [
+    /(?:https?:\/\/|ttps:\/\/|\/\/)[^\s"'<>`]+/gi,
+    /(?:[a-z0-9-]+\.)?lemonforest-[a-z0-9.-]+\.azurecontainerapps\.io\/[^\s"'<>`]+/gi,
+    /https%3A%2F%2F[^\s"'<>`]+/gi
+  ];
+
+  for (const pattern of patterns) {
+    const matches = cleaned.match(pattern) || [];
+
+    for (const match of matches) {
+      const candidate = trimUrl(match);
+
+      if (!looksUseful(candidate)) continue;
+      if (seen.has(candidate)) continue;
+
+      seen.add(candidate);
+
+      const parsed = parseFoundUrl(candidate, source, baseUrl);
+
+      if (parsed) {
+        results.push(parsed);
+      }
+    }
+  }
+
+  return results;
+}
+
 module.exports = {
-  extractFirstProxyVideo,
-  parseProxyUrl
+  extractUrlsFromText,
+  parseFoundUrl,
+  looksUseful,
+  repairBrokenProtocol,
+  addHttpsToBareUrl
 };
