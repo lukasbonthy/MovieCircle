@@ -1,0 +1,15 @@
+{
+  "name": "movieresolver-api",
+  "version": "1.0.0",
+  "description": "API that resolves the first proxy-video URL from embed.filmu.in/movie/{id}",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "install-browser": "npx playwright install chromium",
+    "test-sample": "node src/test-sample.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "1.59.1"
+  }
+}
