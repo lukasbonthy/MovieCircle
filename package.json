@@ -1,7 +1,8 @@
 {
   "name": "movieresolver-api",
-  "version": "1.0.0",
-  "description": "API that resolves the first proxy-video URL from embed.filmu.in/movie/{id}",
+  "version": "9.0.0",
+  "private": true,
+  "description": "Faster reliable Movie proxy-video resolver API for Render",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
