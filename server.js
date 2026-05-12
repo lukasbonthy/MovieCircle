@@ -11,13 +11,13 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Faster, but still reliable
-const FIRST_PASS_WAIT_MS = Number(process.env.FIRST_PASS_WAIT_MS || 2200);
-const AFTER_CLICK_WAIT_MS = Number(process.env.AFTER_CLICK_WAIT_MS || 2600);
-const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 18000);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
-const RESPONSE_BODY_LIMIT_BYTES = Number(process.env.RESPONSE_BODY_LIMIT_BYTES || 4 * 1024 * 1024);
-const STATIC_FETCH_TIMEOUT_MS = Number(process.env.STATIC_FETCH_TIMEOUT_MS || 1000);
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 3500);
+const SCRIPT_TIMEOUT_MS = Number(process.env.SCRIPT_TIMEOUT_MS || 2500);
+const MAX_ASSETS_TO_SCAN = Number(process.env.MAX_ASSETS_TO_SCAN || 35);
+const BROWSER_WAIT_MS = Number(process.env.BROWSER_WAIT_MS || 6000);
+const ENABLE_BROWSER_FALLBACK = process.env.ENABLE_BROWSER_FALLBACK !== '0';
+const RESPONSE_BODY_LIMIT_BYTES = Number(process.env.RESPONSE_BODY_LIMIT_BYTES || 2 * 1024 * 1024);
 
 const cache = new Map();
 const pending = new Map();
@@ -26,26 +26,21 @@ let browserPromise = null;
 let contextPromise = null;
 
 app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 function jsonError(res, status, message, extra = {}) {
-  return res.status(status).json({
-    ok: false,
-    error: message,
-    ...extra
-  });
+  return res.status(status).json({ ok: false, error: message, ...extra });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function firstProxyVideoOnly(items) {
@@ -60,7 +55,6 @@ function firstProxyVideoOnly(items) {
     if (!useful) continue;
 
     const key = [item.type, working, item.decodedVideoUrl || ''].join('|');
-
     if (seen.has(key)) continue;
 
     seen.add(key);
@@ -70,14 +64,177 @@ function firstProxyVideoOnly(items) {
   return null;
 }
 
+function addFoundFromText(found, text, source, baseUrl) {
+  if (!text) return null;
+
+  const items = extractUrlsFromText(text, source, baseUrl);
+  found.push(...items);
+
+  return firstProxyVideoOnly(found);
+}
+
+function getHeaders(baseUrl) {
+  return {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    Accept:
+      'text/html,application/xhtml+xml,application/xml;q=0.9,text/javascript,application/javascript,application/json,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Referer: baseUrl,
+    Origin: new URL(baseUrl).origin
+  };
+}
+
+async function fetchText(url, baseUrl, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      redirect: 'follow',
+      headers: getHeaders(baseUrl)
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+
+    if (
+      !contentType.includes('text') &&
+      !contentType.includes('javascript') &&
+      !contentType.includes('json') &&
+      !contentType.includes('html') &&
+      !contentType.includes('xml') &&
+      !contentType.includes('mpegurl')
+    ) {
+      return '';
+    }
+
+    return await response.text().catch(() => '');
+  } catch {
+    return '';
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function uniquePush(set, url) {
+  if (!url) return;
+
+  try {
+    const clean = addHttpsToBareUrl(repairBrokenProtocol(String(url).trim()));
+    if (clean) set.add(clean);
+  } catch {}
+}
+
+function extractAssetUrls(html, baseUrl) {
+  const urls = new Set();
+
+  const patterns = [
+    /<script[^>]+src=["']([^"']+)["']/gi,
+    /<iframe[^>]+src=["']([^"']+)["']/gi,
+    /<source[^>]+src=["']([^"']+)["']/gi,
+    /<(?:link|a)[^>]+href=["']([^"']+)["']/gi,
+    /["']([^"']+\.(?:js|json|m3u8)(?:\?[^"']*)?)["']/gi,
+    /["'](\/[^"']*(?:proxy|video|embed|player|movie|api)[^"']*)["']/gi
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of html.matchAll(pattern)) {
+      const raw = match[1];
+
+      try {
+        const absolute = new URL(raw, baseUrl).toString();
+        uniquePush(urls, absolute);
+      } catch {}
+    }
+  }
+
+  return [...urls].slice(0, MAX_ASSETS_TO_SCAN);
+}
+
+async function mapLimit(items, limit, mapper) {
+  const results = [];
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const current = items[index++];
+      results.push(await mapper(current).catch(() => null));
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function staticResolve(movieId, targetUrl) {
+  const found = [];
+
+  const html = await fetchText(targetUrl, targetUrl, HTTP_TIMEOUT_MS);
+  let first = addFoundFromText(found, html, 'static-html', targetUrl);
+
+  if (first) {
+    return {
+      ok: true,
+      movieId,
+      sourceUrl: targetUrl,
+      result: first,
+      mode: 'static-html'
+    };
+  }
+
+  const assets = extractAssetUrls(html, targetUrl);
+
+  await mapLimit(assets, 8, async (assetUrl) => {
+    if (firstProxyVideoOnly(found)) return;
+
+    const parsedDirect = parseFoundUrl(assetUrl, 'static-asset-url', targetUrl);
+    if (parsedDirect) found.push(parsedDirect);
+
+    if (firstProxyVideoOnly(found)) return;
+
+    const text = await fetchText(assetUrl, targetUrl, SCRIPT_TIMEOUT_MS);
+    addFoundFromText(found, text, 'static-asset-body', assetUrl);
+
+    if (text) {
+      const nestedAssets = extractAssetUrls(text, assetUrl).slice(0, 8);
+
+      for (const nested of nestedAssets) {
+        if (firstProxyVideoOnly(found)) break;
+
+        const nestedText = await fetchText(nested, targetUrl, SCRIPT_TIMEOUT_MS);
+        addFoundFromText(found, nestedText, 'static-nested-asset', nested);
+      }
+    }
+  });
+
+  first = firstProxyVideoOnly(found);
+
+  if (first) {
+    return {
+      ok: true,
+      movieId,
+      sourceUrl: targetUrl,
+      result: first,
+      mode: 'static-assets'
+    };
+  }
+
+  return {
+    ok: false,
+    movieId,
+    sourceUrl: targetUrl,
+    result: null,
+    mode: 'static-none'
+  };
+}
+
 function shouldReadResponseBody(url, contentType, headers = {}) {
   const lowerUrl = String(url || '').toLowerCase();
   const lowerType = String(contentType || '').toLowerCase();
   const contentLength = Number(headers['content-length'] || 0);
 
-  if (contentLength && contentLength > RESPONSE_BODY_LIMIT_BYTES) {
-    return false;
-  }
+  if (contentLength && contentLength > RESPONSE_BODY_LIMIT_BYTES) return false;
 
   return (
     lowerType.includes('text/') ||
@@ -142,12 +299,9 @@ async function getBrowser() {
 async function getSharedContext() {
   if (!contextPromise) {
     contextPromise = getBrowser()
-      .then((browser) => {
-        return browser.newContext({
-          viewport: {
-            width: 1280,
-            height: 720
-          },
+      .then((browser) =>
+        browser.newContext({
+          viewport: { width: 1280, height: 720 },
           javaScriptEnabled: true,
           bypassCSP: true,
           ignoreHTTPSErrors: true,
@@ -157,8 +311,8 @@ async function getSharedContext() {
           extraHTTPHeaders: {
             'Accept-Language': 'en-US,en;q=0.9'
           }
-        });
-      })
+        })
+      )
       .catch((error) => {
         contextPromise = null;
         throw error;
@@ -168,16 +322,13 @@ async function getSharedContext() {
   return contextPromise;
 }
 
-async function dumpFrameContent(page, baseUrl, found) {
+async function dumpFrames(page, found, targetUrl) {
   for (const frame of page.frames()) {
     const frameUrl = frame.url();
-    const frameBase = frameUrl && frameUrl !== 'about:blank' ? frameUrl : baseUrl;
+    const base = frameUrl && frameUrl !== 'about:blank' ? frameUrl : targetUrl;
 
     const html = await frame.content().catch(() => '');
-
-    if (html) {
-      found.push(...extractUrlsFromText(html, 'frame-html', frameBase));
-    }
+    addFoundFromText(found, html, 'browser-frame', base);
 
     const storageText = await frame
       .evaluate(() => {
@@ -201,162 +352,23 @@ async function dumpFrameContent(page, baseUrl, found) {
       })
       .catch(() => '');
 
-    if (storageText) {
-      found.push(...extractUrlsFromText(storageText, 'browser-storage', frameBase));
-    }
+    addFoundFromText(found, storageText, 'browser-storage', base);
+
+    if (firstProxyVideoOnly(found)) return;
   }
 }
 
-async function waitForFirst(page, found, baseUrl, ms, responseTasks) {
-  const end = Date.now() + ms;
-  let lastDump = 0;
-
-  while (Date.now() < end) {
-    const first = firstProxyVideoOnly(found);
-
-    if (first) {
-      return first;
-    }
-
-    const now = Date.now();
-
-    if (now - lastDump > 700) {
-      lastDump = now;
-
-      await dumpFrameContent(page, baseUrl, found).catch(() => {});
-
-      const afterDump = firstProxyVideoOnly(found);
-
-      if (afterDump) {
-        return afterDump;
-      }
-    }
-
-    if (responseTasks.size) {
-      await Promise.race([
-        Promise.allSettled([...responseTasks]),
-        page.waitForTimeout(100).catch(() => {})
-      ]).catch(() => {});
-    } else {
-      await page.waitForTimeout(130).catch(() => {});
-    }
-  }
-
-  return firstProxyVideoOnly(found);
-}
-
-async function clickPossiblePlayers(page, found, targetUrl) {
-  const selectors = [
-    'video',
-    '.jw-icon-playback',
-    '.vjs-big-play-button',
-    '.plyr__control',
-    "[aria-label*='play' i]",
-    "[class*='play' i]",
-    "[id*='play' i]",
-    "[role='button']",
-    'button',
-    'svg'
-  ];
-
-  await page.mouse.click(640, 360).catch(() => {});
-  await page.keyboard.press('Space').catch(() => {});
-  await page.waitForTimeout(300).catch(() => {});
-
-  if (firstProxyVideoOnly(found)) return;
-
-  for (const frame of page.frames()) {
-    for (const selector of selectors) {
-      if (firstProxyVideoOnly(found)) return;
-
-      const loc = frame.locator(selector).first();
-      const count = await loc.count().catch(() => 0);
-
-      if (!count) continue;
-
-      await loc
-        .click({
-          timeout: 400,
-          force: true
-        })
-        .catch(() => {});
-
-      await page.waitForTimeout(160).catch(() => {});
-    }
-  }
-
-  await dumpFrameContent(page, targetUrl, found).catch(() => {});
-}
-
-function cached(movieId) {
-  const item = cache.get(movieId);
-
-  if (!item) {
-    return null;
-  }
-
-  if (Date.now() - item.savedAt > CACHE_TTL_MS) {
-    cache.delete(movieId);
-    return null;
-  }
-
-  return item.data;
-}
-
-async function tryStaticFetch(targetUrl, found) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), STATIC_FETCH_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(targetUrl, {
-      signal: controller.signal,
-      redirect: 'follow',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      }
-    });
-
-    const text = await response.text().catch(() => '');
-
-    if (text) {
-      found.push(...extractUrlsFromText(text, 'static-fetch', targetUrl));
-    }
-  } catch {
-    // Chromium scan handles it.
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function resolveMovie(movieId) {
-  const targetUrl = `https://embed.filmu.in/movie/${encodeURIComponent(movieId)}`;
+async function browserFallback(movieId, targetUrl) {
   const found = [];
   const responseTasks = new Set();
 
   let page;
 
-  await tryStaticFetch(targetUrl, found);
-
-  let first = firstProxyVideoOnly(found);
-
-  if (first) {
-    return {
-      ok: true,
-      movieId,
-      sourceUrl: targetUrl,
-      result: first,
-      mode: 'static-fetch'
-    };
-  }
-
   try {
     const context = await getSharedContext();
     page = await context.newPage();
 
-    page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+    page.setDefaultNavigationTimeout(14000);
     page.setDefaultTimeout(5000);
 
     await page.route('**/*', async (route) => {
@@ -365,19 +377,11 @@ async function resolveMovie(movieId) {
       const type = request.resourceType();
 
       if (looksUseful(url)) {
-        const item = parseFoundUrl(url, 'network-route', targetUrl);
-
-        if (item) {
-          found.push({
-            ...item,
-            method: request.method(),
-            resourceType: type
-          });
-        }
+        const item = parseFoundUrl(url, 'browser-route', targetUrl);
+        if (item) found.push({ ...item, method: request.method(), resourceType: type });
       }
 
-      // Safe blocking only.
-      // Do NOT block media, script, xhr, fetch, or stylesheet.
+      // Safe blocking only. Do not block media/script/xhr/fetch.
       if (type === 'image' || type === 'font') {
         return route.abort().catch(() => {});
       }
@@ -412,28 +416,21 @@ async function resolveMovie(movieId) {
     });
 
     page.on('console', (msg) => {
-      found.push(...extractUrlsFromText(msg.text(), 'console', targetUrl));
+      addFoundFromText(found, msg.text(), 'browser-console', targetUrl);
     });
 
     page.on('request', (request) => {
       const url = request.url();
 
       if (looksUseful(url)) {
-        const item = parseFoundUrl(url, 'network-request', targetUrl);
-
-        if (item) {
-          found.push({
-            ...item,
-            method: request.method(),
-            resourceType: request.resourceType()
-          });
-        }
+        const item = parseFoundUrl(url, 'browser-request', targetUrl);
+        if (item) found.push({ ...item, method: request.method(), resourceType: request.resourceType() });
       }
 
       const postData = request.postData();
 
       if (postData && looksUseful(postData)) {
-        found.push(...extractUrlsFromText(postData, 'request-post-data', targetUrl));
+        addFoundFromText(found, postData, 'browser-post-data', targetUrl);
       }
     });
 
@@ -448,25 +445,15 @@ async function resolveMovie(movieId) {
           String(contentType).includes('video') ||
           String(contentType).includes('mpegurl')
         ) {
-          const item = parseFoundUrl(url, 'network-response', targetUrl);
-
-          if (item) {
-            found.push({
-              ...item,
-              status: response.status(),
-              contentType
-            });
-          }
+          const item = parseFoundUrl(url, 'browser-response', targetUrl);
+          if (item) found.push({ ...item, status: response.status(), contentType });
         }
 
         if (firstProxyVideoOnly(found)) return;
 
         if (shouldReadResponseBody(url, contentType, headers)) {
           const text = await response.text().catch(() => '');
-
-          if (text) {
-            found.push(...extractUrlsFromText(text, 'response-body', url));
-          }
+          addFoundFromText(found, text, 'browser-response-body', url);
         }
       })()
         .catch(() => {})
@@ -475,22 +462,16 @@ async function resolveMovie(movieId) {
       responseTasks.add(task);
     });
 
-    const safeTargetUrl = addHttpsToBareUrl(repairBrokenProtocol(targetUrl));
-
     await page
-      .goto(safeTargetUrl, {
+      .goto(targetUrl, {
         waitUntil: 'domcontentloaded',
-        timeout: NAV_TIMEOUT_MS
+        timeout: 14000
       })
-      .catch(() => {});
+      .catch(() => null);
 
-    first = await waitForFirst(
-      page,
-      found,
-      targetUrl,
-      FIRST_PASS_WAIT_MS,
-      responseTasks
-    );
+    await dumpFrames(page, found, targetUrl).catch(() => {});
+
+    let first = firstProxyVideoOnly(found);
 
     if (first) {
       return {
@@ -498,34 +479,47 @@ async function resolveMovie(movieId) {
         movieId,
         sourceUrl: targetUrl,
         result: first,
-        mode: 'browser-first-pass'
+        mode: 'browser-frame'
       };
     }
 
-    await clickPossiblePlayers(page, found, targetUrl);
+    await page.mouse.click(640, 360).catch(() => {});
+    await page.keyboard.press('Space').catch(() => {});
 
-    first = await waitForFirst(
-      page,
-      found,
-      targetUrl,
-      AFTER_CLICK_WAIT_MS,
-      responseTasks
-    );
+    const end = Date.now() + BROWSER_WAIT_MS;
 
-    if (first) {
-      return {
-        ok: true,
-        movieId,
-        sourceUrl: targetUrl,
-        result: first,
-        mode: 'browser-after-click'
-      };
+    while (Date.now() < end) {
+      first = firstProxyVideoOnly(found);
+
+      if (first) {
+        return {
+          ok: true,
+          movieId,
+          sourceUrl: targetUrl,
+          result: first,
+          mode: 'browser-network'
+        };
+      }
+
+      await dumpFrames(page, found, targetUrl).catch(() => {});
+
+      first = firstProxyVideoOnly(found);
+
+      if (first) {
+        return {
+          ok: true,
+          movieId,
+          sourceUrl: targetUrl,
+          result: first,
+          mode: 'browser-dump'
+        };
+      }
+
+      await Promise.race([
+        Promise.allSettled([...responseTasks]),
+        sleep(350)
+      ]).catch(() => {});
     }
-
-    await Promise.race([
-      Promise.allSettled([...responseTasks]),
-      page.waitForTimeout(700).catch(() => {})
-    ]).catch(() => {});
 
     first = firstProxyVideoOnly(found);
 
@@ -541,21 +535,45 @@ async function resolveMovie(movieId) {
   }
 }
 
+function cached(movieId) {
+  const item = cache.get(movieId);
+
+  if (!item) return null;
+
+  if (Date.now() - item.savedAt > CACHE_TTL_MS) {
+    cache.delete(movieId);
+    return null;
+  }
+
+  return item.data;
+}
+
+async function resolveMovie(movieId) {
+  const targetUrl = `https://embed.filmu.in/movie/${encodeURIComponent(movieId)}`;
+
+  const staticResult = await staticResolve(movieId, targetUrl);
+
+  if (staticResult.ok && staticResult.result) {
+    return staticResult;
+  }
+
+  if (!ENABLE_BROWSER_FALLBACK) {
+    return staticResult;
+  }
+
+  return browserFallback(movieId, targetUrl);
+}
+
 async function resolveMovieCached(movieId, refresh = false) {
   if (!refresh) {
     const hit = cached(movieId);
 
     if (hit) {
-      return {
-        ...hit,
-        cached: true
-      };
+      return { ...hit, cached: true };
     }
   }
 
-  if (pending.has(movieId)) {
-    return pending.get(movieId);
-  }
+  if (pending.has(movieId)) return pending.get(movieId);
 
   const job = resolveMovie(movieId)
     .then((data) => {
@@ -566,30 +584,22 @@ async function resolveMovieCached(movieId, refresh = false) {
         });
       }
 
-      return {
-        ...data,
-        cached: false
-      };
+      return { ...data, cached: false };
     })
     .finally(() => pending.delete(movieId));
 
   pending.set(movieId, job);
-
   return job;
 }
 
 app.get('/', (_req, res) => {
   res
     .type('text/plain')
-    .send(
-      'MovieResolver API\n\nUse: GET /movie/{number}\nExample: /movie/1726\nRefresh: /movie/1726?refresh=1\n'
-    );
+    .send('MovieResolver API\n\nUse: GET /movie/{number}\nExample: /movie/1726\nRefresh: /movie/1726?refresh=1\n');
 });
 
 app.get('/healthz', (_req, res) => {
-  res.json({
-    ok: true
-  });
+  res.json({ ok: true });
 });
 
 app.get('/movie/:id', async (req, res) => {
@@ -643,7 +653,7 @@ const server = app.listen(PORT, () => {
   console.log(`MovieResolver API running on port ${PORT}`);
 
   getSharedContext()
-    .then(() => console.log('Chromium context warmed up'))
+    .then(() => console.log('Chromium fallback warmed up'))
     .catch((error) => console.error('Chromium warmup failed:', error.message));
 });
 
