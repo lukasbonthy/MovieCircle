@@ -1,7 +1,13 @@
 function cleanText(text = '') {
   return String(text)
     .replace(/&amp;/g, '&')
-    .replace(/\\u0026/g, '&')
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => {
+      try {
+        return String.fromCharCode(parseInt(hex, 16));
+      } catch {
+        return _;
+      }
+    })
     .replace(/\\\//g, '/');
 }
 
@@ -12,16 +18,20 @@ function trimUrl(url = '') {
     .replace(/[),.;"'<>`\]}]+$/g, '');
 }
 
-function toAbsolute(raw, baseUrl) {
-  if (!raw) return null;
-
+function fixUrl(raw = '') {
   let value = trimUrl(cleanText(raw));
 
   if (value.startsWith('ttps://')) value = `h${value}`;
   if (value.startsWith('//')) value = `https:${value}`;
 
+  return value;
+}
+
+function toAbsolute(raw, baseUrl) {
+  if (!raw) return null;
+
   try {
-    return new URL(value, baseUrl).toString();
+    return new URL(fixUrl(raw), baseUrl).toString();
   } catch {
     return null;
   }
@@ -45,7 +55,9 @@ function extractApiProxyUrls(text = '', baseUrl = '') {
     /https?:\/\/[^\s"'<>`]+\/api\/proxy\?path=[^\s"'<>`]+/gi,
     /\/\/[^\s"'<>`]+\/api\/proxy\?path=[^\s"'<>`]+/gi,
     /\/api\/proxy\?path=[^\s"'<>`]+/gi,
-    /["']([^"']*\/api\/proxy\?path=[^"']+)["']/gi
+    /api\/proxy\?path=[^\s"'<>`]+/gi,
+    /["']([^"']*\/api\/proxy\?path=[^"']+)["']/gi,
+    /["']([^"']*api\/proxy\?path=[^"']+)["']/gi
   ];
 
   for (const pattern of patterns) {
@@ -65,7 +77,7 @@ function extractApiProxyUrls(text = '', baseUrl = '') {
   return urls;
 }
 
-function extractAssetUrls(text = '', baseUrl = '') {
+function extractAssetUrls(text = '', baseUrl = '', max = 80) {
   const cleaned = cleanText(text);
   const urls = [];
   const seen = new Set();
@@ -73,15 +85,16 @@ function extractAssetUrls(text = '', baseUrl = '') {
   const patterns = [
     /<script[^>]+src=["']([^"']+)["']/gi,
     /<iframe[^>]+src=["']([^"']+)["']/gi,
+    /<(?:link|a)[^>]+href=["']([^"']+)["']/gi,
     /["']([^"']+\.js(?:\?[^"']*)?)["']/gi,
-    /["']([^"']*api[^"']*)["']/gi,
-    /["']([^"']*proxy[^"']*)["']/gi
+    /["']([^"']+\.json(?:\?[^"']*)?)["']/gi,
+    /["']([^"']*(?:api|proxy|scrape|movie|embed|player)[^"']*)["']/gi,
+    /(?:fetch|open)\(\s*["']([^"']+)["']/gi
   ];
 
   for (const pattern of patterns) {
     for (const match of cleaned.matchAll(pattern)) {
       const absolute = toAbsolute(match[1], baseUrl);
-
       if (!absolute) continue;
 
       const lower = absolute.toLowerCase();
@@ -89,8 +102,12 @@ function extractAssetUrls(text = '', baseUrl = '') {
       if (
         !lower.includes('/api/proxy') &&
         !lower.includes('.js') &&
+        !lower.includes('.json') &&
+        !lower.includes('api') &&
         !lower.includes('proxy') &&
-        !lower.includes('api')
+        !lower.includes('scrape') &&
+        !lower.includes('embed') &&
+        !lower.includes('player')
       ) {
         continue;
       }
@@ -99,17 +116,22 @@ function extractAssetUrls(text = '', baseUrl = '') {
 
       seen.add(absolute);
       urls.push(absolute);
+
+      if (urls.length >= max) return urls;
     }
   }
 
-  return urls.slice(0, 60);
+  return urls;
 }
 
 function findSourcesDeep(value, output = []) {
   if (!value || typeof value !== 'object') return output;
 
   if (Array.isArray(value)) {
-    for (const item of value) findSourcesDeep(item, output);
+    for (const item of value) {
+      findSourcesDeep(item, output);
+    }
+
     return output;
   }
 
@@ -131,17 +153,17 @@ function findFirstM3u8(text = '', apiProxyUrl = '') {
     const json = JSON.parse(cleaned);
     const sources = findSourcesDeep(json);
 
-    const m3u8 = sources.find((source) => {
+    const first = sources.find((source) => {
       return source && source.url && String(source.url).includes('.m3u8');
     });
 
-    if (m3u8) {
+    if (first) {
       return {
-        name: m3u8.name || null,
-        url: m3u8.url,
-        quality: m3u8.quality || null,
-        type: m3u8.type || 'm3u8',
-        headers: m3u8.headers || {},
+        name: first.name || null,
+        url: first.url,
+        quality: first.quality || null,
+        type: first.type || 'm3u8',
+        headers: first.headers || {},
         apiProxyUrl
       };
     }
