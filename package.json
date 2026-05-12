@@ -1,8 +1,8 @@
 {
   "name": "movieresolver-api",
-  "version": "9.0.0",
+  "version": "10.0.0",
   "private": true,
-  "description": "Faster reliable Movie proxy-video resolver API for Render",
+  "description": "Fast Movie proxy-video resolver API for Render",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
