@@ -1,7 +1,6 @@
 function repairBrokenProtocol(value = '') {
   return String(value)
     .replace(/^ttps:\/\//i, 'https://')
-    .replace(/^http:\/\//i, 'http://')
     .replace(/^hhttps:\/\//i, 'https://');
 }
 
@@ -45,37 +44,56 @@ function safeDecode(value = '') {
 function trimUrl(url = '') {
   return String(url)
     .trim()
-    .replace(/[),.;\]}]+$/g, '')
-    .replace(/^["'`]+|["'`]+$/g, '');
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/[)"'<>\]}]+$/g, '');
 }
 
 function looksUseful(value = '') {
   const text = safeDecode(cleanText(value)).toLowerCase();
 
   return (
+    text.includes('proxy?url=') ||
+    text.includes('/proxy?url=') ||
     text.includes('/proxy/video?url=') ||
-    text.includes('/video?url=') ||
-    text.includes('/highscool/video?url=') ||
-    text.includes('/highschool/video?url=') ||
-    text.includes('.mp4') ||
-    text.includes('.m3u8') ||
-    text.includes('.webm') ||
-    text.includes('bcdnxw.')
+    text.includes('/proxy/') ||
+    text.includes('?url=https') ||
+    text.includes('?url=http') ||
+    text.includes('&url=https') ||
+    text.includes('lemonforest-') ||
+    text.includes('azurecontainerapps.io')
   );
 }
 
 function getRawUrlParam(originalUrl = '') {
   const text = cleanText(originalUrl);
 
-  const match = text.match(/[?&]url=([\s\S]*?)(?=&(?:apikey|referer|origin)=|$)/i);
+  // Gets only the inner url= value, stopping before outside params.
+  const match = text.match(/[?&]url=([\s\S]*?)(?=&(?:apikey|referer|origin|key|token)=|$)/i);
 
   if (!match) return null;
 
   return match[1];
 }
 
-function buildEncodedProxyUrl(parsedUrl, originalUrl) {
+function isProxyUrl(parsedUrl, fullUrl) {
+  const decoded = safeDecode(fullUrl).toLowerCase();
+  const path = parsedUrl.pathname.toLowerCase();
+
+  return (
+    parsedUrl.searchParams.has('url') &&
+    (
+      path.includes('/proxy') ||
+      decoded.includes('/proxy?url=') ||
+      decoded.includes('/proxy/video?url=') ||
+      decoded.includes('/proxy/') ||
+      decoded.includes('proxy?url=')
+    )
+  );
+}
+
+function buildWorkingEncodedProxyUrl(parsedUrl, originalUrl) {
   const rawInner = getRawUrlParam(originalUrl);
+
   if (!rawInner) return null;
 
   let decodedVideoUrl = safeDecode(rawInner);
@@ -85,16 +103,16 @@ function buildEncodedProxyUrl(parsedUrl, originalUrl) {
   const referer = parsedUrl.searchParams.get('referer') || '';
   const origin = parsedUrl.searchParams.get('origin') || '';
 
-  const params = [];
+  const params = new URLSearchParams();
 
-  params.push(`url=${encodeURIComponent(decodedVideoUrl)}`);
+  params.set('url', decodedVideoUrl);
 
-  if (apikey) params.push(`apikey=${encodeURIComponent(apikey)}`);
-  if (referer) params.push(`referer=${encodeURIComponent(referer)}`);
-  if (origin) params.push(`origin=${encodeURIComponent(origin)}`);
+  if (apikey) params.set('apikey', apikey);
+  if (referer) params.set('referer', referer);
+  if (origin) params.set('origin', origin);
 
   return {
-    encodedProxyUrl: `${parsedUrl.origin}${parsedUrl.pathname}?${params.join('&')}`,
+    encodedProxyUrl: `${parsedUrl.origin}${parsedUrl.pathname}?${params.toString()}`,
     decodedVideoUrl,
     apikey,
     referer,
@@ -112,33 +130,24 @@ function parseFoundUrl(input, source = 'unknown', baseUrl = '') {
     original = `https:${original}`;
   }
 
-  let urlForParsing = original;
-
-  if (/^https%3A%2F%2F/i.test(urlForParsing)) {
-    urlForParsing = safeDecode(urlForParsing);
+  if (/^https%3A%2F%2F/i.test(original)) {
+    original = safeDecode(original);
   }
 
-  urlForParsing = addHttpsToBareUrl(repairBrokenProtocol(urlForParsing));
+  original = addHttpsToBareUrl(original);
 
   let parsed;
 
   try {
-    parsed = new URL(urlForParsing, baseUrl || undefined);
+    parsed = new URL(original, baseUrl || undefined);
   } catch {
     return null;
   }
 
   const fullUrl = parsed.toString();
-  const lower = safeDecode(fullUrl).toLowerCase();
 
-  const isProxyVideo =
-    lower.includes('/proxy/video?url=') ||
-    lower.includes('/video?url=') ||
-    lower.includes('/highscool/video?url=') ||
-    lower.includes('/highschool/video?url=');
-
-  if (isProxyVideo) {
-    const rebuilt = buildEncodedProxyUrl(parsed, fullUrl);
+  if (isProxyUrl(parsed, fullUrl)) {
+    const rebuilt = buildWorkingEncodedProxyUrl(parsed, fullUrl);
 
     if (!rebuilt) return null;
 
@@ -155,25 +164,6 @@ function parseFoundUrl(input, source = 'unknown', baseUrl = '') {
     };
   }
 
-  const isDirectMedia =
-    lower.includes('.mp4') ||
-    lower.includes('.m3u8') ||
-    lower.includes('.webm');
-
-  if (isDirectMedia) {
-    return {
-      type: 'direct-media',
-      source,
-      url: fullUrl,
-      workingUrl: fullUrl,
-      encodedProxyUrl: null,
-      decodedVideoUrl: fullUrl,
-      apikey: null,
-      referer: null,
-      origin: null
-    };
-  }
-
   return null;
 }
 
@@ -183,16 +173,26 @@ function extractUrlsFromText(text = '', source = 'unknown', baseUrl = '') {
   const seen = new Set();
 
   const patterns = [
+    // Normal full URLs
     /(?:https?:\/\/|ttps:\/\/|\/\/)[^\s"'<>`]+/gi,
-    /(?:[a-z0-9-]+\.)?lemonforest-[a-z0-9.-]+\.azurecontainerapps\.io\/[^\s"'<>`]+/gi,
-    /https%3A%2F%2F[^\s"'<>`]+/gi
+
+    // Encoded full URLs
+    /https%3A%2F%2F[^\s"'<>`]+/gi,
+
+    // Bare azure proxy URLs
+    /[a-z0-9.-]+\.azurecontainerapps\.io\/[^\s"'<>`]+/gi,
+
+    // Relative proxy URLs
+    /\/proxy(?:\/[^\s"'<>`]*)?\?url=[^\s"'<>`]+/gi,
+
+    // Any quoted URL-looking proxy path
+    /["']([^"']*proxy[^"']*\?url=[^"']+)["']/gi
   ];
 
   for (const pattern of patterns) {
-    const matches = cleaned.match(pattern) || [];
-
-    for (const match of matches) {
-      const candidate = trimUrl(match);
+    for (const match of cleaned.matchAll(pattern)) {
+      const raw = match[1] || match[0];
+      const candidate = trimUrl(raw);
 
       if (!looksUseful(candidate)) continue;
       if (seen.has(candidate)) continue;
