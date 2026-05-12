@@ -1,13 +1,12 @@
 {
   "name": "movieresolver-api",
-  "version": "12.0.0",
+  "version": "13.0.0",
   "private": true,
-  "description": "Fast reliable Movie proxy-video resolver API for Render",
+  "description": "Fast proxy URL resolver API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "install-browser": "npx playwright install chromium",
-    "test-sample": "node src/test-sample.js"
+    "install-browser": "npx playwright install chromium"
   },
   "dependencies": {
     "express": "^4.19.2",
