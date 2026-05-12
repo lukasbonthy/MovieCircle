@@ -45,162 +45,205 @@ function trimUrl(url = '') {
   return String(url)
     .trim()
     .replace(/^["'`]+|["'`]+$/g, '')
-    .replace(/[)"'<>\]}]+$/g, '');
+    .replace(/[),.;"'<>`\]}]+$/g, '');
 }
 
-function looksUseful(value = '') {
-  const decoded = safeDecode(cleanText(value)).toLowerCase();
+function toAbsoluteUrl(raw, baseUrl) {
+  if (!raw) return null;
 
-  return decoded.includes('/proxy/video?');
-}
+  let candidate = trimUrl(cleanText(raw));
+  candidate = repairBrokenProtocol(candidate);
 
-function getRawUrlParam(originalUrl = '') {
-  const text = cleanText(originalUrl);
-
-  const match = text.match(/[?&]url=([\s\S]*?)(?=&(?:apikey|referer|origin|key|token)=|$)/i);
-
-  if (!match) return null;
-
-  return match[1];
-}
-
-function isProxyVideoUrl(parsedUrl, fullUrl) {
-  const decoded = safeDecode(fullUrl).toLowerCase();
-
-  return (
-    decoded.includes('/proxy/video?') &&
-    parsedUrl.searchParams.has('url')
-  );
-}
-
-function buildWorkingEncodedProxyUrl(parsedUrl, originalUrl) {
-  const rawInner = getRawUrlParam(originalUrl);
-
-  if (!rawInner) return null;
-
-  let decodedVideoUrl = safeDecode(rawInner);
-  decodedVideoUrl = addHttpsToBareUrl(repairBrokenProtocol(decodedVideoUrl));
-
-  const apikey = parsedUrl.searchParams.get('apikey') || '';
-  const referer = parsedUrl.searchParams.get('referer') || '';
-  const origin = parsedUrl.searchParams.get('origin') || '';
-
-  const params = new URLSearchParams();
-
-  params.set('url', decodedVideoUrl);
-
-  if (apikey) params.set('apikey', apikey);
-  if (referer) params.set('referer', referer);
-  if (origin) params.set('origin', origin);
-
-  return {
-    encodedProxyUrl: `${parsedUrl.origin}${parsedUrl.pathname}?${params.toString()}`,
-    decodedVideoUrl,
-    apikey,
-    referer,
-    origin
-  };
-}
-
-function parseFoundUrl(input, source = 'unknown', baseUrl = '') {
-  if (!input) return null;
-
-  let original = trimUrl(cleanText(input));
-  original = repairBrokenProtocol(original);
-
-  if (original.startsWith('//')) {
-    original = `https:${original}`;
+  if (/^https%3A%2F%2F/i.test(candidate)) {
+    candidate = safeDecode(candidate);
   }
 
-  if (/^https%3A%2F%2F/i.test(original)) {
-    original = safeDecode(original);
+  if (candidate.startsWith('//')) {
+    candidate = `https:${candidate}`;
   }
-
-  original = addHttpsToBareUrl(original);
-
-  let parsed;
 
   try {
-    parsed = new URL(original, baseUrl || undefined);
+    return new URL(candidate, baseUrl || undefined).toString();
   } catch {
     return null;
   }
-
-  const fullUrl = parsed.toString();
-
-  // Required rule:
-  // The returned result MUST contain /proxy/video?
-  if (!isProxyVideoUrl(parsed, fullUrl)) {
-    return null;
-  }
-
-  const rebuilt = buildWorkingEncodedProxyUrl(parsed, fullUrl);
-
-  if (!rebuilt) return null;
-
-  return {
-    type: 'proxy-video',
-    source,
-    url: fullUrl,
-    workingUrl: rebuilt.encodedProxyUrl,
-    encodedProxyUrl: rebuilt.encodedProxyUrl,
-    decodedVideoUrl: rebuilt.decodedVideoUrl,
-    apikey: rebuilt.apikey || null,
-    referer: rebuilt.referer || null,
-    origin: rebuilt.origin || null
-  };
 }
 
-function extractUrlsFromText(text = '', source = 'unknown', baseUrl = '') {
+function isApiProxyUrl(url) {
+  try {
+    const parsed = new URL(addHttpsToBareUrl(repairBrokenProtocol(url)));
+    const decoded = safeDecode(parsed.toString()).toLowerCase();
+
+    return (
+      parsed.pathname === '/api/proxy' &&
+      parsed.searchParams.has('path') &&
+      decoded.includes('/api/proxy?path=')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function extractApiProxyUrlsFromText(text = '', baseUrl = '') {
   const cleaned = cleanText(text);
   const results = [];
   const seen = new Set();
 
   const patterns = [
-    // Normal full URLs
     /(?:https?:\/\/|ttps:\/\/|\/\/)[^\s"'<>`]+/gi,
-
-    // Encoded full URLs
     /https%3A%2F%2F[^\s"'<>`]+/gi,
-
-    // Bare Azure URLs
-    /[a-z0-9.-]+\.azurecontainerapps\.io\/[^\s"'<>`]+/gi,
-
-    // Any relative path that contains /proxy/video?url=
-    /\/[^\s"'<>`]*proxy\/video\?url=[^\s"'<>`]+/gi,
-
-    // Any quoted proxy video URL/path
-    /["']([^"']*\/proxy\/video\?url=[^"']+)["']/gi,
-
-    // Encoded proxy/video pattern
-    /[^\s"'<>`]*%2Fproxy%2Fvideo%3Furl%3D[^\s"'<>`]+/gi
+    /\/api\/proxy\?path=[^\s"'<>`]+/gi,
+    /api\/proxy\?path=[^\s"'<>`]+/gi,
+    /["']([^"']*\/api\/proxy\?path=[^"']+)["']/gi
   ];
 
   for (const pattern of patterns) {
     for (const match of cleaned.matchAll(pattern)) {
       const raw = match[1] || match[0];
-      const candidate = trimUrl(raw);
+      const absolute = toAbsoluteUrl(raw, baseUrl);
 
-      if (!looksUseful(candidate)) continue;
-      if (seen.has(candidate)) continue;
+      if (!absolute) continue;
+      if (!isApiProxyUrl(absolute)) continue;
+      if (seen.has(absolute)) continue;
 
-      seen.add(candidate);
-
-      const parsed = parseFoundUrl(candidate, source, baseUrl);
-
-      if (parsed) {
-        results.push(parsed);
-      }
+      seen.add(absolute);
+      results.push(absolute);
     }
   }
 
   return results;
 }
 
+function extractAssetUrls(text = '', baseUrl = '', max = 40) {
+  const cleaned = cleanText(text);
+  const urls = [];
+  const seen = new Set();
+
+  const patterns = [
+    /<script[^>]+src=["']([^"']+)["']/gi,
+    /<iframe[^>]+src=["']([^"']+)["']/gi,
+    /<source[^>]+src=["']([^"']+)["']/gi,
+    /<(?:link|a)[^>]+href=["']([^"']+)["']/gi,
+    /["']([^"']+\.(?:js|json|m3u8)(?:\?[^"']*)?)["']/gi,
+    /["'](\/[^"']*(?:api|proxy|scrape|vidrock|movie|player|embed)[^"']*)["']/gi,
+    /(?:fetch|open)\(\s*["']([^"']+)["']/gi
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of cleaned.matchAll(pattern)) {
+      const raw = match[1] || match[0];
+      const absolute = toAbsoluteUrl(raw, baseUrl);
+
+      if (!absolute) continue;
+
+      const lower = absolute.toLowerCase();
+
+      const useful =
+        lower.includes('/api/proxy') ||
+        lower.includes('vidrock') ||
+        lower.includes('scrape') ||
+        lower.includes('player') ||
+        lower.includes('embed') ||
+        lower.includes('/movie') ||
+        lower.includes('.js') ||
+        lower.includes('.json') ||
+        lower.includes('.m3u8');
+
+      if (!useful) continue;
+      if (seen.has(absolute)) continue;
+
+      seen.add(absolute);
+      urls.push(absolute);
+
+      if (urls.length >= max) return urls;
+    }
+  }
+
+  return urls;
+}
+
+function findSourcesDeep(value, output = []) {
+  if (!value || typeof value !== 'object') return output;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      findSourcesDeep(item, output);
+    }
+
+    return output;
+  }
+
+  if (Array.isArray(value.sources)) {
+    output.push(...value.sources);
+  }
+
+  for (const item of Object.values(value)) {
+    findSourcesDeep(item, output);
+  }
+
+  return output;
+}
+
+function normalizeStreamSource(source, apiProxyUrl, foundIn) {
+  if (!source || typeof source !== 'object') return null;
+
+  const url = source.url || source.file || source.src;
+
+  if (!url || !String(url).includes('.m3u8')) return null;
+
+  return {
+    name: source.name || 'Unknown',
+    url,
+    quality: source.quality || null,
+    type: source.type || 'm3u8',
+    headers: source.headers || {},
+    apiProxyUrl,
+    foundIn
+  };
+}
+
+function parseM3u8FromApiResponse(text = '', apiProxyUrl = '', foundIn = 'api-response') {
+  const cleaned = cleanText(text);
+
+  try {
+    const json = JSON.parse(cleaned);
+    const sources = findSourcesDeep(json);
+
+    const m3u8 = sources
+      .map((source) => normalizeStreamSource(source, apiProxyUrl, foundIn))
+      .find(Boolean);
+
+    if (m3u8) return m3u8;
+  } catch {
+    // Fallback below.
+  }
+
+  const directMatch = cleaned.match(/https?:\/\/[^\s"'<>`]+\.m3u8[^\s"'<>`]*/i);
+
+  if (directMatch) {
+    return {
+      name: 'Direct m3u8',
+      url: trimUrl(directMatch[0]),
+      quality: null,
+      type: 'm3u8',
+      headers: {},
+      apiProxyUrl,
+      foundIn
+    };
+  }
+
+  return null;
+}
+
 module.exports = {
-  extractUrlsFromText,
-  parseFoundUrl,
-  looksUseful,
   repairBrokenProtocol,
-  addHttpsToBareUrl
+  addHttpsToBareUrl,
+  cleanText,
+  safeDecode,
+  trimUrl,
+  toAbsoluteUrl,
+  isApiProxyUrl,
+  extractApiProxyUrlsFromText,
+  extractAssetUrls,
+  parseM3u8FromApiResponse
 };
