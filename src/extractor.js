@@ -28,7 +28,7 @@ function cleanText(text = '') {
 function safeDecode(value = '') {
   let output = String(value);
 
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     try {
       const decoded = decodeURIComponent(output);
       if (decoded === output) break;
@@ -49,22 +49,14 @@ function trimUrl(url = '') {
 }
 
 function looksUseful(value = '') {
-  const text = safeDecode(cleanText(value)).toLowerCase();
+  const decoded = safeDecode(cleanText(value)).toLowerCase();
 
-  return (
-    text.includes('/proxy/video?') ||
-    text.includes('/proxy/video%3f') ||
-    text.includes('proxy%2fvideo%3f') ||
-    text.includes('lemonforest-') ||
-    text.includes('azurecontainerapps.io')
-  );
+  return decoded.includes('/proxy/video?');
 }
 
 function getRawUrlParam(originalUrl = '') {
   const text = cleanText(originalUrl);
 
-  // Keeps inner video URL whole, including inner &t=...
-  // Stops only when outside proxy params begin.
   const match = text.match(/[?&]url=([\s\S]*?)(?=&(?:apikey|referer|origin|key|token)=|$)/i);
 
   if (!match) return null;
@@ -72,14 +64,12 @@ function getRawUrlParam(originalUrl = '') {
   return match[1];
 }
 
-function isStrictProxyVideoUrl(parsedUrl, fullUrl) {
+function isProxyVideoUrl(parsedUrl, fullUrl) {
   const decoded = safeDecode(fullUrl).toLowerCase();
-  const path = parsedUrl.pathname.toLowerCase();
 
   return (
-    parsedUrl.searchParams.has('url') &&
-    path === '/proxy/video' &&
-    decoded.includes('/proxy/video?')
+    decoded.includes('/proxy/video?') &&
+    parsedUrl.searchParams.has('url')
   );
 }
 
@@ -138,8 +128,9 @@ function parseFoundUrl(input, source = 'unknown', baseUrl = '') {
 
   const fullUrl = parsed.toString();
 
-  // STRICT: must be /proxy/video?url=
-  if (!isStrictProxyVideoUrl(parsed, fullUrl)) {
+  // Required rule:
+  // The returned result MUST contain /proxy/video?
+  if (!isProxyVideoUrl(parsed, fullUrl)) {
     return null;
   }
 
@@ -175,11 +166,14 @@ function extractUrlsFromText(text = '', source = 'unknown', baseUrl = '') {
     // Bare Azure URLs
     /[a-z0-9.-]+\.azurecontainerapps\.io\/[^\s"'<>`]+/gi,
 
-    // Relative strict proxy-video path
-    /\/proxy\/video\?url=[^\s"'<>`]+/gi,
+    // Any relative path that contains /proxy/video?url=
+    /\/[^\s"'<>`]*proxy\/video\?url=[^\s"'<>`]+/gi,
 
-    // Quoted strict proxy-video URL/path
-    /["']([^"']*\/proxy\/video\?url=[^"']+)["']/gi
+    // Any quoted proxy video URL/path
+    /["']([^"']*\/proxy\/video\?url=[^"']+)["']/gi,
+
+    // Encoded proxy/video pattern
+    /[^\s"'<>`]*%2Fproxy%2Fvideo%3Furl%3D[^\s"'<>`]+/gi
   ];
 
   for (const pattern of patterns) {
