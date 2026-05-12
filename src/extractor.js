@@ -52,13 +52,14 @@ function looksUseful(value = '') {
   const text = safeDecode(cleanText(value)).toLowerCase();
 
   return (
-    text.includes('proxy?url=') ||
     text.includes('/proxy?url=') ||
     text.includes('/proxy/video?url=') ||
+    text.includes('proxy?url=') ||
     text.includes('/proxy/') ||
     text.includes('?url=https') ||
     text.includes('?url=http') ||
     text.includes('&url=https') ||
+    text.includes('&url=http') ||
     text.includes('lemonforest-') ||
     text.includes('azurecontainerapps.io')
   );
@@ -67,7 +68,8 @@ function looksUseful(value = '') {
 function getRawUrlParam(originalUrl = '') {
   const text = cleanText(originalUrl);
 
-  // Gets only the inner url= value, stopping before outside params.
+  // Keeps the inner video URL whole, including inner &t=...
+  // Stops only when outside proxy params begin.
   const match = text.match(/[?&]url=([\s\S]*?)(?=&(?:apikey|referer|origin|key|token)=|$)/i);
 
   if (!match) return null;
@@ -146,25 +148,25 @@ function parseFoundUrl(input, source = 'unknown', baseUrl = '') {
 
   const fullUrl = parsed.toString();
 
-  if (isProxyUrl(parsed, fullUrl)) {
-    const rebuilt = buildWorkingEncodedProxyUrl(parsed, fullUrl);
-
-    if (!rebuilt) return null;
-
-    return {
-      type: 'proxy-video',
-      source,
-      url: fullUrl,
-      workingUrl: rebuilt.encodedProxyUrl,
-      encodedProxyUrl: rebuilt.encodedProxyUrl,
-      decodedVideoUrl: rebuilt.decodedVideoUrl,
-      apikey: rebuilt.apikey || null,
-      referer: rebuilt.referer || null,
-      origin: rebuilt.origin || null
-    };
+  if (!isProxyUrl(parsed, fullUrl)) {
+    return null;
   }
 
-  return null;
+  const rebuilt = buildWorkingEncodedProxyUrl(parsed, fullUrl);
+
+  if (!rebuilt) return null;
+
+  return {
+    type: 'proxy-video',
+    source,
+    url: fullUrl,
+    workingUrl: rebuilt.encodedProxyUrl,
+    encodedProxyUrl: rebuilt.encodedProxyUrl,
+    decodedVideoUrl: rebuilt.decodedVideoUrl,
+    apikey: rebuilt.apikey || null,
+    referer: rebuilt.referer || null,
+    origin: rebuilt.origin || null
+  };
 }
 
 function extractUrlsFromText(text = '', source = 'unknown', baseUrl = '') {
@@ -173,19 +175,10 @@ function extractUrlsFromText(text = '', source = 'unknown', baseUrl = '') {
   const seen = new Set();
 
   const patterns = [
-    // Normal full URLs
     /(?:https?:\/\/|ttps:\/\/|\/\/)[^\s"'<>`]+/gi,
-
-    // Encoded full URLs
     /https%3A%2F%2F[^\s"'<>`]+/gi,
-
-    // Bare azure proxy URLs
     /[a-z0-9.-]+\.azurecontainerapps\.io\/[^\s"'<>`]+/gi,
-
-    // Relative proxy URLs
     /\/proxy(?:\/[^\s"'<>`]*)?\?url=[^\s"'<>`]+/gi,
-
-    // Any quoted URL-looking proxy path
     /["']([^"']*proxy[^"']*\?url=[^"']+)["']/gi
   ];
 
