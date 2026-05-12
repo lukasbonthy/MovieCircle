@@ -11,16 +11,18 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const FIRST_PASS_WAIT_MS = Number(process.env.FIRST_PASS_WAIT_MS || 3000);
-const AFTER_CLICK_WAIT_MS = Number(process.env.AFTER_CLICK_WAIT_MS || 3500);
-const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 35000);
+// Faster defaults
+const FIRST_PASS_WAIT_MS = Number(process.env.FIRST_PASS_WAIT_MS || 1200);
+const AFTER_CLICK_WAIT_MS = Number(process.env.AFTER_CLICK_WAIT_MS || 1800);
+const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 18000);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
-const RESPONSE_BODY_LIMIT_BYTES = Number(process.env.RESPONSE_BODY_LIMIT_BYTES || 4 * 1024 * 1024);
-const BLOCK_IMAGES_FONTS = process.env.BLOCK_IMAGES_FONTS !== '0';
+const RESPONSE_BODY_LIMIT_BYTES = Number(process.env.RESPONSE_BODY_LIMIT_BYTES || 900 * 1024);
 
 const cache = new Map();
 const pending = new Map();
+
 let browserPromise = null;
+let contextPromise = null;
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
@@ -29,12 +31,20 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
   next();
 });
 
 function jsonError(res, status, message, extra = {}) {
-  return res.status(status).json({ ok: false, error: message, ...extra });
+  return res.status(status).json({
+    ok: false,
+    error: message,
+    ...extra
+  });
 }
 
 function firstProxyVideoOnly(items) {
@@ -45,12 +55,14 @@ function firstProxyVideoOnly(items) {
 
     const working = item.workingUrl || item.encodedProxyUrl || item.url || '';
     const useful = looksUseful(working) || looksUseful(item.decodedVideoUrl || '');
+
     if (!useful) continue;
 
     const key = [item.type, working, item.decodedVideoUrl || ''].join('|');
-    if (seen.has(key)) continue;
-    seen.add(key);
 
+    if (seen.has(key)) continue;
+
+    seen.add(key);
     return item;
   }
 
@@ -62,7 +74,9 @@ function shouldReadResponseBody(url, contentType, headers = {}) {
   const lowerType = String(contentType || '').toLowerCase();
   const contentLength = Number(headers['content-length'] || 0);
 
-  if (contentLength && contentLength > RESPONSE_BODY_LIMIT_BYTES) return false;
+  if (contentLength && contentLength > RESPONSE_BODY_LIMIT_BYTES) {
+    return false;
+  }
 
   return (
     lowerType.includes('text/') ||
@@ -89,28 +103,71 @@ async function getBrowser() {
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
           '--disable-gpu',
+          '--disable-extensions',
+          '--disable-background-networking',
+          '--disable-background-timer-throttling',
+          '--disable-renderer-backgrounding',
+          '--disable-sync',
+          '--disable-default-apps',
+          '--disable-popup-blocking',
+          '--no-first-run',
+          '--no-default-browser-check',
           '--autoplay-policy=no-user-gesture-required'
         ]
       })
       .then((browser) => {
         browser.on('disconnected', () => {
           browserPromise = null;
+          contextPromise = null;
         });
+
         return browser;
       })
       .catch((error) => {
         browserPromise = null;
+        contextPromise = null;
         throw error;
       });
   }
 
   const browser = await browserPromise;
+
   if (!browser.isConnected()) {
     browserPromise = null;
+    contextPromise = null;
     return getBrowser();
   }
 
   return browser;
+}
+
+async function getSharedContext() {
+  if (!contextPromise) {
+    contextPromise = getBrowser()
+      .then((browser) => {
+        return browser.newContext({
+          viewport: {
+            width: 1280,
+            height: 720
+          },
+          javaScriptEnabled: true,
+          bypassCSP: true,
+          ignoreHTTPSErrors: true,
+          serviceWorkers: 'block',
+          userAgent:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+          extraHTTPHeaders: {
+            'Accept-Language': 'en-US,en;q=0.9'
+          }
+        });
+      })
+      .catch((error) => {
+        contextPromise = null;
+        throw error;
+      });
+  }
+
+  return contextPromise;
 }
 
 async function dumpFrameContent(page, baseUrl, found) {
@@ -119,7 +176,10 @@ async function dumpFrameContent(page, baseUrl, found) {
     const frameBase = frameUrl && frameUrl !== 'about:blank' ? frameUrl : baseUrl;
 
     const html = await frame.content().catch(() => '');
-    if (html) found.push(...extractUrlsFromText(html, 'frame-html', frameBase));
+
+    if (html) {
+      found.push(...extractUrlsFromText(html, 'frame-html', frameBase));
+    }
 
     const storageText = await frame
       .evaluate(() => {
@@ -143,7 +203,9 @@ async function dumpFrameContent(page, baseUrl, found) {
       })
       .catch(() => '');
 
-    if (storageText) found.push(...extractUrlsFromText(storageText, 'browser-storage', frameBase));
+    if (storageText) {
+      found.push(...extractUrlsFromText(storageText, 'browser-storage', frameBase));
+    }
   }
 }
 
@@ -153,26 +215,32 @@ async function waitForFirst(page, found, baseUrl, ms, responseTasks) {
 
   while (Date.now() < end) {
     const first = firstProxyVideoOnly(found);
-    if (first) return first;
+
+    if (first) {
+      return first;
+    }
 
     const now = Date.now();
 
-    if (now - lastDump > 900) {
+    if (now - lastDump > 500) {
       lastDump = now;
 
       await dumpFrameContent(page, baseUrl, found).catch(() => {});
 
       const afterDump = firstProxyVideoOnly(found);
-      if (afterDump) return afterDump;
+
+      if (afterDump) {
+        return afterDump;
+      }
     }
 
     if (responseTasks.size) {
       await Promise.race([
         Promise.allSettled([...responseTasks]),
-        page.waitForTimeout(120).catch(() => {})
+        page.waitForTimeout(80).catch(() => {})
       ]).catch(() => {});
     } else {
-      await page.waitForTimeout(180).catch(() => {});
+      await page.waitForTimeout(100).catch(() => {});
     }
   }
 
@@ -189,13 +257,12 @@ async function clickPossiblePlayers(page, found, targetUrl) {
     "[class*='play' i]",
     "[id*='play' i]",
     "[role='button']",
-    'button',
-    'svg'
+    'button'
   ];
 
-  await page.mouse.click(683, 384).catch(() => {});
+  await page.mouse.click(640, 360).catch(() => {});
   await page.keyboard.press('Space').catch(() => {});
-  await page.waitForTimeout(450).catch(() => {});
+  await page.waitForTimeout(250).catch(() => {});
 
   if (firstProxyVideoOnly(found)) return;
 
@@ -208,8 +275,12 @@ async function clickPossiblePlayers(page, found, targetUrl) {
 
       if (!count) continue;
 
-      await loc.click({ timeout: 550, force: true }).catch(() => {});
-      await page.waitForTimeout(250).catch(() => {});
+      await loc.click({
+        timeout: 350,
+        force: true
+      }).catch(() => {});
+
+      await page.waitForTimeout(130).catch(() => {});
     }
   }
 
@@ -219,7 +290,9 @@ async function clickPossiblePlayers(page, found, targetUrl) {
 function cached(movieId) {
   const item = cache.get(movieId);
 
-  if (!item) return null;
+  if (!item) {
+    return null;
+  }
 
   if (Date.now() - item.savedAt > CACHE_TTL_MS) {
     cache.delete(movieId);
@@ -231,7 +304,7 @@ function cached(movieId) {
 
 async function tryStaticFetch(targetUrl, found) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4500);
+  const timeout = setTimeout(() => controller.abort(), 2500);
 
   try {
     const response = await fetch(targetUrl, {
@@ -246,9 +319,12 @@ async function tryStaticFetch(targetUrl, found) {
     });
 
     const text = await response.text().catch(() => '');
-    if (text) found.push(...extractUrlsFromText(text, 'static-fetch', targetUrl));
+
+    if (text) {
+      found.push(...extractUrlsFromText(text, 'static-fetch', targetUrl));
+    }
   } catch {
-    // Browser scan below is the real fallback.
+    // Browser scan is the fallback.
   } finally {
     clearTimeout(timeout);
   }
@@ -258,9 +334,13 @@ async function resolveMovie(movieId) {
   const targetUrl = `https://embed.filmu.in/movie/${encodeURIComponent(movieId)}`;
   const found = [];
   const responseTasks = new Set();
+  let page;
 
   const direct = parseFoundUrl(targetUrl, 'input-url', targetUrl);
-  if (direct && looksUseful(direct.url)) found.push(direct);
+
+  if (direct && looksUseful(direct.url)) {
+    found.push(direct);
+  }
 
   await tryStaticFetch(targetUrl, found);
 
@@ -276,46 +356,43 @@ async function resolveMovie(movieId) {
     };
   }
 
-  let context;
-
   try {
-    const browser = await getBrowser();
-
-    context = await browser.newContext({
-      viewport: { width: 1365, height: 768 },
-      javaScriptEnabled: true,
-      bypassCSP: true,
-      ignoreHTTPSErrors: true,
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      extraHTTPHeaders: {
-        'Accept-Language': 'en-US,en;q=0.9'
-      }
-    });
-
-    const page = await context.newPage();
+    const context = await getSharedContext();
+    page = await context.newPage();
 
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
-    page.setDefaultTimeout(6500);
+    page.setDefaultTimeout(4500);
 
-    if (BLOCK_IMAGES_FONTS) {
-      await context.route('**/*', async (route) => {
-        const request = route.request();
-        const url = request.url();
-        const type = request.resourceType();
+    await page.route('**/*', async (route) => {
+      const request = route.request();
+      const url = request.url();
+      const type = request.resourceType();
 
-        if (looksUseful(url)) {
-          const item = parseFoundUrl(url, 'network-route', targetUrl);
-          if (item) found.push({ ...item, method: request.method(), resourceType: type });
+      if (looksUseful(url)) {
+        const item = parseFoundUrl(url, 'network-route', targetUrl);
+
+        if (item) {
+          found.push({
+            ...item,
+            method: request.method(),
+            resourceType: type
+          });
         }
+      }
 
-        if (type === 'image' || type === 'font') {
-          return route.abort().catch(() => {});
-        }
+      // Block heavy stuff. This makes Chromium faster.
+      // Do NOT block scripts/xhr/fetch because those may reveal the proxy URL.
+      if (
+        type === 'image' ||
+        type === 'font' ||
+        type === 'stylesheet' ||
+        type === 'media'
+      ) {
+        return route.abort().catch(() => {});
+      }
 
-        return route.continue().catch(() => {});
-      });
-    }
+      return route.continue().catch(() => {});
+    });
 
     await page.addInitScript(() => {
       try {
@@ -352,7 +429,14 @@ async function resolveMovie(movieId) {
 
       if (looksUseful(url)) {
         const item = parseFoundUrl(url, 'network-request', targetUrl);
-        if (item) found.push({ ...item, method: request.method(), resourceType: request.resourceType() });
+
+        if (item) {
+          found.push({
+            ...item,
+            method: request.method(),
+            resourceType: request.resourceType()
+          });
+        }
       }
 
       const postData = request.postData();
@@ -374,12 +458,22 @@ async function resolveMovie(movieId) {
           String(contentType).includes('mpegurl')
         ) {
           const item = parseFoundUrl(url, 'network-response', targetUrl);
-          if (item) found.push({ ...item, status: response.status(), contentType });
+
+          if (item) {
+            found.push({
+              ...item,
+              status: response.status(),
+              contentType
+            });
+          }
         }
 
         if (shouldReadResponseBody(url, contentType, headers)) {
           const text = await response.text().catch(() => '');
-          if (text) found.push(...extractUrlsFromText(text, 'response-body', url));
+
+          if (text) {
+            found.push(...extractUrlsFromText(text, 'response-body', url));
+          }
         }
       })()
         .catch(() => {})
@@ -395,7 +489,13 @@ async function resolveMovie(movieId) {
       timeout: NAV_TIMEOUT_MS
     }).catch(() => {});
 
-    first = await waitForFirst(page, found, targetUrl, FIRST_PASS_WAIT_MS, responseTasks);
+    first = await waitForFirst(
+      page,
+      found,
+      targetUrl,
+      FIRST_PASS_WAIT_MS,
+      responseTasks
+    );
 
     if (first) {
       return {
@@ -409,7 +509,13 @@ async function resolveMovie(movieId) {
 
     await clickPossiblePlayers(page, found, targetUrl);
 
-    first = await waitForFirst(page, found, targetUrl, AFTER_CLICK_WAIT_MS, responseTasks);
+    first = await waitForFirst(
+      page,
+      found,
+      targetUrl,
+      AFTER_CLICK_WAIT_MS,
+      responseTasks
+    );
 
     if (first) {
       return {
@@ -423,7 +529,7 @@ async function resolveMovie(movieId) {
 
     await Promise.race([
       Promise.allSettled([...responseTasks]),
-      page.waitForTimeout(900).catch(() => {})
+      page.waitForTimeout(500).catch(() => {})
     ]).catch(() => {});
 
     first = firstProxyVideoOnly(found);
@@ -436,7 +542,7 @@ async function resolveMovie(movieId) {
       mode: 'browser-final'
     };
   } finally {
-    await context?.close().catch(() => {});
+    await page?.close().catch(() => {});
   }
 }
 
@@ -452,7 +558,9 @@ async function resolveMovieCached(movieId, refresh = false) {
     }
   }
 
-  if (pending.has(movieId)) return pending.get(movieId);
+  if (pending.has(movieId)) {
+    return pending.get(movieId);
+  }
 
   const job = resolveMovie(movieId)
     .then((data) => {
@@ -478,11 +586,15 @@ async function resolveMovieCached(movieId, refresh = false) {
 app.get('/', (_req, res) => {
   res
     .type('text/plain')
-    .send('MovieResolver API\n\nUse: GET /movie/{number}\nExample: /movie/1726\nRefresh: /movie/1726?refresh=1\n');
+    .send(
+      'MovieResolver API\n\nUse: GET /movie/{number}\nExample: /movie/1726\nRefresh: /movie/1726?refresh=1\n'
+    );
 });
 
 app.get('/healthz', (_req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true
+  });
 });
 
 app.get('/movie/:id', async (req, res) => {
@@ -535,8 +647,8 @@ app.use((req, res) => {
 const server = app.listen(PORT, () => {
   console.log(`MovieResolver API running on port ${PORT}`);
 
-  getBrowser()
-    .then(() => console.log('Chromium warmed up'))
+  getSharedContext()
+    .then(() => console.log('Chromium context warmed up'))
     .catch((error) => console.error('Chromium warmup failed:', error.message));
 });
 
