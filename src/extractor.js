@@ -1,44 +1,8 @@
-function repairBrokenProtocol(value = '') {
-  return String(value)
-    .replace(/^ttps:\/\//i, 'https://')
-    .replace(/^hhttps:\/\//i, 'https://');
-}
-
-function addHttpsToBareUrl(value = '') {
-  const text = String(value).trim();
-
-  if (/^https?:\/\//i.test(text)) return text;
-  if (/^\/\//.test(text)) return `https:${text}`;
-
-  if (/^[a-z0-9.-]+\.[a-z]{2,}\//i.test(text)) {
-    return `https://${text}`;
-  }
-
-  return text;
-}
-
 function cleanText(text = '') {
   return String(text)
     .replace(/&amp;/g, '&')
     .replace(/\\u0026/g, '&')
-    .replace(/\\\//g, '/')
-    .replace(/%5Cu0026/gi, '%26');
-}
-
-function safeDecode(value = '') {
-  let output = String(value);
-
-  for (let i = 0; i < 5; i++) {
-    try {
-      const decoded = decodeURIComponent(output);
-      if (decoded === output) break;
-      output = decoded;
-    } catch {
-      break;
-    }
-  }
-
-  return output;
+    .replace(/\\\//g, '/');
 }
 
 function trimUrl(url = '') {
@@ -48,73 +12,60 @@ function trimUrl(url = '') {
     .replace(/[),.;"'<>`\]}]+$/g, '');
 }
 
-function toAbsoluteUrl(raw, baseUrl) {
+function toAbsolute(raw, baseUrl) {
   if (!raw) return null;
 
-  let candidate = trimUrl(cleanText(raw));
-  candidate = repairBrokenProtocol(candidate);
+  let value = trimUrl(cleanText(raw));
 
-  if (/^https%3A%2F%2F/i.test(candidate)) {
-    candidate = safeDecode(candidate);
-  }
-
-  if (candidate.startsWith('//')) {
-    candidate = `https:${candidate}`;
-  }
+  if (value.startsWith('ttps://')) value = `h${value}`;
+  if (value.startsWith('//')) value = `https:${value}`;
 
   try {
-    return new URL(candidate, baseUrl || undefined).toString();
+    return new URL(value, baseUrl).toString();
   } catch {
     return null;
   }
 }
 
-function isApiProxyUrl(url) {
+function isApiProxy(url) {
   try {
-    const parsed = new URL(addHttpsToBareUrl(repairBrokenProtocol(url)));
-    const decoded = safeDecode(parsed.toString()).toLowerCase();
-
-    return (
-      parsed.pathname === '/api/proxy' &&
-      parsed.searchParams.has('path') &&
-      decoded.includes('/api/proxy?path=')
-    );
+    const parsed = new URL(url);
+    return parsed.pathname === '/api/proxy' && parsed.searchParams.has('path');
   } catch {
     return false;
   }
 }
 
-function extractApiProxyUrlsFromText(text = '', baseUrl = '') {
+function extractApiProxyUrls(text = '', baseUrl = '') {
   const cleaned = cleanText(text);
-  const results = [];
+  const urls = [];
   const seen = new Set();
 
   const patterns = [
-    /(?:https?:\/\/|ttps:\/\/|\/\/)[^\s"'<>`]+/gi,
-    /https%3A%2F%2F[^\s"'<>`]+/gi,
+    /https?:\/\/[^\s"'<>`]+\/api\/proxy\?path=[^\s"'<>`]+/gi,
+    /\/\/[^\s"'<>`]+\/api\/proxy\?path=[^\s"'<>`]+/gi,
     /\/api\/proxy\?path=[^\s"'<>`]+/gi,
-    /api\/proxy\?path=[^\s"'<>`]+/gi,
     /["']([^"']*\/api\/proxy\?path=[^"']+)["']/gi
   ];
 
   for (const pattern of patterns) {
     for (const match of cleaned.matchAll(pattern)) {
       const raw = match[1] || match[0];
-      const absolute = toAbsoluteUrl(raw, baseUrl);
+      const absolute = toAbsolute(raw, baseUrl);
 
       if (!absolute) continue;
-      if (!isApiProxyUrl(absolute)) continue;
+      if (!isApiProxy(absolute)) continue;
       if (seen.has(absolute)) continue;
 
       seen.add(absolute);
-      results.push(absolute);
+      urls.push(absolute);
     }
   }
 
-  return results;
+  return urls;
 }
 
-function extractAssetUrls(text = '', baseUrl = '', max = 40) {
+function extractAssetUrls(text = '', baseUrl = '') {
   const cleaned = cleanText(text);
   const urls = [];
   const seen = new Set();
@@ -122,54 +73,43 @@ function extractAssetUrls(text = '', baseUrl = '', max = 40) {
   const patterns = [
     /<script[^>]+src=["']([^"']+)["']/gi,
     /<iframe[^>]+src=["']([^"']+)["']/gi,
-    /<source[^>]+src=["']([^"']+)["']/gi,
-    /<(?:link|a)[^>]+href=["']([^"']+)["']/gi,
-    /["']([^"']+\.(?:js|json|m3u8)(?:\?[^"']*)?)["']/gi,
-    /["'](\/[^"']*(?:api|proxy|scrape|vidrock|movie|player|embed)[^"']*)["']/gi,
-    /(?:fetch|open)\(\s*["']([^"']+)["']/gi
+    /["']([^"']+\.js(?:\?[^"']*)?)["']/gi,
+    /["']([^"']*api[^"']*)["']/gi,
+    /["']([^"']*proxy[^"']*)["']/gi
   ];
 
   for (const pattern of patterns) {
     for (const match of cleaned.matchAll(pattern)) {
-      const raw = match[1] || match[0];
-      const absolute = toAbsoluteUrl(raw, baseUrl);
+      const absolute = toAbsolute(match[1], baseUrl);
 
       if (!absolute) continue;
 
       const lower = absolute.toLowerCase();
 
-      const useful =
-        lower.includes('/api/proxy') ||
-        lower.includes('vidrock') ||
-        lower.includes('scrape') ||
-        lower.includes('player') ||
-        lower.includes('embed') ||
-        lower.includes('/movie') ||
-        lower.includes('.js') ||
-        lower.includes('.json') ||
-        lower.includes('.m3u8');
+      if (
+        !lower.includes('/api/proxy') &&
+        !lower.includes('.js') &&
+        !lower.includes('proxy') &&
+        !lower.includes('api')
+      ) {
+        continue;
+      }
 
-      if (!useful) continue;
       if (seen.has(absolute)) continue;
 
       seen.add(absolute);
       urls.push(absolute);
-
-      if (urls.length >= max) return urls;
     }
   }
 
-  return urls;
+  return urls.slice(0, 60);
 }
 
 function findSourcesDeep(value, output = []) {
   if (!value || typeof value !== 'object') return output;
 
   if (Array.isArray(value)) {
-    for (const item of value) {
-      findSourcesDeep(item, output);
-    }
-
+    for (const item of value) findSourcesDeep(item, output);
     return output;
   }
 
@@ -184,51 +124,39 @@ function findSourcesDeep(value, output = []) {
   return output;
 }
 
-function normalizeStreamSource(source, apiProxyUrl, foundIn) {
-  if (!source || typeof source !== 'object') return null;
-
-  const url = source.url || source.file || source.src;
-
-  if (!url || !String(url).includes('.m3u8')) return null;
-
-  return {
-    name: source.name || 'Unknown',
-    url,
-    quality: source.quality || null,
-    type: source.type || 'm3u8',
-    headers: source.headers || {},
-    apiProxyUrl,
-    foundIn
-  };
-}
-
-function parseM3u8FromApiResponse(text = '', apiProxyUrl = '', foundIn = 'api-response') {
+function findFirstM3u8(text = '', apiProxyUrl = '') {
   const cleaned = cleanText(text);
 
   try {
     const json = JSON.parse(cleaned);
     const sources = findSourcesDeep(json);
 
-    const m3u8 = sources
-      .map((source) => normalizeStreamSource(source, apiProxyUrl, foundIn))
-      .find(Boolean);
+    const m3u8 = sources.find((source) => {
+      return source && source.url && String(source.url).includes('.m3u8');
+    });
 
-    if (m3u8) return m3u8;
-  } catch {
-    // Fallback below.
-  }
+    if (m3u8) {
+      return {
+        name: m3u8.name || null,
+        url: m3u8.url,
+        quality: m3u8.quality || null,
+        type: m3u8.type || 'm3u8',
+        headers: m3u8.headers || {},
+        apiProxyUrl
+      };
+    }
+  } catch {}
 
-  const directMatch = cleaned.match(/https?:\/\/[^\s"'<>`]+\.m3u8[^\s"'<>`]*/i);
+  const match = cleaned.match(/https?:\/\/[^\s"'<>`]+\.m3u8[^\s"'<>`]*/i);
 
-  if (directMatch) {
+  if (match) {
     return {
-      name: 'Direct m3u8',
-      url: trimUrl(directMatch[0]),
+      name: null,
+      url: trimUrl(match[0]),
       quality: null,
       type: 'm3u8',
       headers: {},
-      apiProxyUrl,
-      foundIn
+      apiProxyUrl
     };
   }
 
@@ -236,14 +164,9 @@ function parseM3u8FromApiResponse(text = '', apiProxyUrl = '', foundIn = 'api-re
 }
 
 module.exports = {
-  repairBrokenProtocol,
-  addHttpsToBareUrl,
   cleanText,
-  safeDecode,
-  trimUrl,
-  toAbsoluteUrl,
-  isApiProxyUrl,
-  extractApiProxyUrlsFromText,
+  isApiProxy,
+  extractApiProxyUrls,
   extractAssetUrls,
-  parseM3u8FromApiResponse
+  findFirstM3u8
 };
