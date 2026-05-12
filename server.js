@@ -1,11 +1,13 @@
 const express = require('express');
 const { chromium } = require('playwright');
 const {
-  extractUrlsFromText,
-  parseFoundUrl,
-  looksUseful,
   repairBrokenProtocol,
-  addHttpsToBareUrl
+  addHttpsToBareUrl,
+  cleanText,
+  isApiProxyUrl,
+  extractApiProxyUrlsFromText,
+  extractAssetUrls,
+  parseM3u8FromApiResponse
 } = require('./src/extractor');
 
 const app = express();
@@ -15,15 +17,14 @@ const FRESH_CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000
 const STALE_CACHE_TTL_MS = Number(process.env.STALE_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
 
 const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 2200);
-const SCRIPT_TIMEOUT_MS = Number(process.env.SCRIPT_TIMEOUT_MS || 1800);
-const MAX_ASSETS_TO_SCAN = Number(process.env.MAX_ASSETS_TO_SCAN || 30);
+const API_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 4500);
+const ASSET_TIMEOUT_MS = Number(process.env.ASSET_TIMEOUT_MS || 1800);
+const MAX_ASSETS_TO_SCAN = Number(process.env.MAX_ASSETS_TO_SCAN || 40);
 
 const ENABLE_BROWSER_FALLBACK = process.env.ENABLE_BROWSER_FALLBACK !== '0';
-const BROWSER_FAST_WAIT_MS = Number(process.env.BROWSER_FAST_WAIT_MS || 1800);
-const BROWSER_TOTAL_WAIT_MS = Number(process.env.BROWSER_TOTAL_WAIT_MS || 7500);
+const BROWSER_TOTAL_WAIT_MS = Number(process.env.BROWSER_TOTAL_WAIT_MS || 7000);
 const CLICK_AFTER_MS = Number(process.env.CLICK_AFTER_MS || 1200);
 
-const RESPONSE_BODY_LIMIT_BYTES = Number(process.env.RESPONSE_BODY_LIMIT_BYTES || 2 * 1024 * 1024);
 const MAX_PARALLEL_SCANS = Number(process.env.MAX_PARALLEL_SCANS || 2);
 
 const cache = new Map();
@@ -56,27 +57,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function firstProxyVideoOnly(items) {
-  const seen = new Set();
-
-  for (const item of items.filter(Boolean)) {
-    if (item.type !== 'proxy-video') continue;
-
-    const working = item.workingUrl || item.encodedProxyUrl || item.url || '';
-    const useful = looksUseful(working) || looksUseful(item.decodedVideoUrl || '');
-
-    if (!useful) continue;
-
-    const key = [item.type, working, item.decodedVideoUrl || ''].join('|');
-    if (seen.has(key)) continue;
-
-    seen.add(key);
-    return item;
-  }
-
-  return null;
-}
-
 function createLimiter(max) {
   let active = 0;
   const queue = [];
@@ -85,8 +65,7 @@ function createLimiter(max) {
     active++;
 
     try {
-      const value = await fn();
-      resolve(value);
+      resolve(await fn());
     } catch (error) {
       reject(error);
     } finally {
@@ -112,6 +91,39 @@ function createLimiter(max) {
 
 const scanLimit = createLimiter(MAX_PARALLEL_SCANS);
 
+function createDebug(enabled) {
+  const checked = [];
+  const apiUrlsSeen = [];
+  const assetUrls = [];
+
+  return {
+    enabled,
+
+    check(value) {
+      if (!enabled) return;
+      if (checked.length < 200) checked.push(value);
+    },
+
+    api(url, source) {
+      if (!enabled || !url) return;
+      if (apiUrlsSeen.length < 100) apiUrlsSeen.push({ source, url });
+    },
+
+    asset(url) {
+      if (!enabled || !url) return;
+      if (assetUrls.length < 100) assetUrls.push(url);
+    },
+
+    data() {
+      return {
+        checked,
+        apiUrlsSeen,
+        assetUrls
+      };
+    }
+  };
+}
+
 function createFoundSignal() {
   let resolved = false;
   let resolveNow;
@@ -122,96 +134,23 @@ function createFoundSignal() {
 
   return {
     promise,
-    resolve(item) {
-      if (!resolved && item) {
+
+    resolve(value) {
+      if (!resolved && value) {
         resolved = true;
-        resolveNow(item);
+        resolveNow(value);
       }
     }
   };
 }
 
-function createDebug(enabled) {
-  const checked = [];
-  const usefulUrlsSeen = [];
-  const assetUrls = [];
-  const seenUrls = new Set();
-  const seenAssets = new Set();
-
-  return {
-    enabled,
-
-    check(name) {
-      if (!enabled) return;
-      if (checked.length < 150) checked.push(name);
-    },
-
-    url(source, url, note = '') {
-      if (!enabled || !url || !looksUseful(url)) return;
-
-      const key = `${source}|${url}`;
-      if (seenUrls.has(key)) return;
-
-      seenUrls.add(key);
-
-      if (usefulUrlsSeen.length < 120) {
-        usefulUrlsSeen.push({ source, url, note });
-      }
-    },
-
-    asset(url) {
-      if (!enabled || !url) return;
-      if (seenAssets.has(url)) return;
-
-      seenAssets.add(url);
-
-      if (assetUrls.length < 80) {
-        assetUrls.push(url);
-      }
-    },
-
-    data() {
-      return {
-        checked,
-        usefulUrlsSeen,
-        assetUrls
-      };
-    }
-  };
-}
-
-function addParsedItems(found, items, debug, signal) {
-  for (const item of items || []) {
-    found.push(item);
-    debug.url(item.source || 'parsed', item.url || item.workingUrl, 'parsed-proxy');
-
-    const first = firstProxyVideoOnly(found);
-
-    if (first && signal) {
-      signal.resolve(first);
-    }
-  }
-
-  return firstProxyVideoOnly(found);
-}
-
-function addFoundFromText(found, text, source, baseUrl, debug, signal) {
-  debug.check(source);
-
-  if (!text) return firstProxyVideoOnly(found);
-
-  const items = extractUrlsFromText(text, source, baseUrl);
-  return addParsedItems(found, items, debug, signal);
-}
-
-function getHeaders(baseUrl) {
+function requestHeaders(baseUrl) {
   const origin = new URL(baseUrl).origin;
 
   return {
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    Accept:
-      'text/html,application/xhtml+xml,application/xml;q=0.9,text/javascript,application/javascript,application/json,*/*;q=0.8',
+    Accept: 'application/json,text/plain,text/html,application/javascript,*/*',
     'Accept-Language': 'en-US,en;q=0.9',
     Referer: baseUrl,
     Origin: origin
@@ -226,86 +165,40 @@ async function fetchText(url, baseUrl, timeoutMs) {
     const response = await fetch(url, {
       signal: controller.signal,
       redirect: 'follow',
-      headers: getHeaders(baseUrl)
+      headers: requestHeaders(baseUrl)
     });
 
-    const contentType = response.headers.get('content-type') || '';
-    const lowerType = contentType.toLowerCase();
-    const lowerUrl = url.toLowerCase();
-
-    const blockedType =
-      lowerType.includes('image') ||
-      lowerType.includes('font') ||
-      lowerType.includes('video');
-
-    const usefulFile =
-      lowerUrl.includes('.js') ||
-      lowerUrl.includes('.json') ||
-      lowerUrl.includes('.m3u8') ||
-      lowerUrl.includes('proxy') ||
-      lowerUrl.includes('player') ||
-      lowerUrl.includes('embed') ||
-      lowerUrl.includes('api');
-
-    if (blockedType && !usefulFile) {
-      return '';
-    }
-
-    return await response.text().catch(() => '');
+    return {
+      ok: response.ok,
+      status: response.status,
+      url: response.url,
+      contentType: response.headers.get('content-type') || '',
+      text: await response.text().catch(() => '')
+    };
   } catch {
-    return '';
+    return {
+      ok: false,
+      status: 0,
+      url,
+      contentType: '',
+      text: ''
+    };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function addAsset(set, raw, baseUrl, debug) {
-  if (!raw) return;
+async function fetchApiProxy(apiProxyUrl, sourceUrl, debug, foundIn = 'api-proxy-fetch') {
+  if (!apiProxyUrl || !isApiProxyUrl(apiProxyUrl)) return null;
 
-  try {
-    const fixed = addHttpsToBareUrl(repairBrokenProtocol(String(raw).trim()));
-    const absolute = new URL(fixed, baseUrl).toString();
-    const lower = absolute.toLowerCase();
+  debug.api(apiProxyUrl, foundIn);
+  debug.check(`fetch-api:${apiProxyUrl}`);
 
-    const useful =
-      lower.includes('proxy') ||
-      lower.includes('player') ||
-      lower.includes('embed') ||
-      lower.includes('/api') ||
-      lower.includes('/movie') ||
-      lower.includes('filmu') ||
-      lower.includes('.js') ||
-      lower.includes('.json') ||
-      lower.includes('.m3u8');
+  const response = await fetchText(apiProxyUrl, sourceUrl, API_TIMEOUT_MS);
 
-    if (!useful) return;
+  if (!response.text) return null;
 
-    set.add(absolute);
-    debug.asset(absolute);
-  } catch {}
-}
-
-function extractAssetUrls(html, baseUrl, debug) {
-  const urls = new Set();
-  const text = String(html || '');
-
-  const patterns = [
-    /<script[^>]+src=["']([^"']+)["']/gi,
-    /<iframe[^>]+src=["']([^"']+)["']/gi,
-    /<source[^>]+src=["']([^"']+)["']/gi,
-    /<(?:link|a)[^>]+href=["']([^"']+)["']/gi,
-    /["']([^"']+\.(?:js|json|m3u8)(?:\?[^"']*)?)["']/gi,
-    /["'](\/[^"']*(?:proxy|video|embed|player|movie|api)[^"']*)["']/gi,
-    /(?:fetch|open)\(\s*["']([^"']+)["']/gi
-  ];
-
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) {
-      addAsset(urls, match[1], baseUrl, debug);
-    }
-  }
-
-  return [...urls].slice(0, MAX_ASSETS_TO_SCAN);
+  return parseM3u8FromApiResponse(response.text, apiProxyUrl, foundIn);
 }
 
 async function mapLimit(items, limit, mapper) {
@@ -322,84 +215,98 @@ async function mapLimit(items, limit, mapper) {
 }
 
 async function staticResolve(movieId, targetUrl, debug) {
-  const found = [];
+  debug.check('static-html');
 
-  debug.check('static-html-fetch');
+  const htmlResponse = await fetchText(targetUrl, targetUrl, HTTP_TIMEOUT_MS);
+  const html = htmlResponse.text || '';
 
-  const html = await fetchText(targetUrl, targetUrl, HTTP_TIMEOUT_MS);
-  let first = addFoundFromText(found, html, 'static-html', targetUrl, debug);
+  const apiUrls = extractApiProxyUrlsFromText(html, targetUrl);
 
-  if (first) {
+  for (const apiUrl of apiUrls) {
+    const stream = await fetchApiProxy(apiUrl, targetUrl, debug, 'static-html-api');
+
+    if (stream) {
+      return {
+        ok: true,
+        movieId,
+        sourceUrl: targetUrl,
+        apiProxyUrl: apiUrl,
+        stream,
+        mode: 'static-html-api'
+      };
+    }
+  }
+
+  const assets = extractAssetUrls(html, targetUrl, MAX_ASSETS_TO_SCAN);
+
+  for (const asset of assets) {
+    debug.asset(asset);
+  }
+
+  let foundStream = null;
+
+  await mapLimit(assets, 8, async (assetUrl) => {
+    if (foundStream) return;
+
+    debug.check(`asset:${assetUrl}`);
+
+    if (isApiProxyUrl(assetUrl)) {
+      foundStream = await fetchApiProxy(assetUrl, targetUrl, debug, 'static-asset-url');
+      return;
+    }
+
+    const assetResponse = await fetchText(assetUrl, targetUrl, ASSET_TIMEOUT_MS);
+    const assetText = assetResponse.text || '';
+
+    const directStream = parseM3u8FromApiResponse(assetText, assetUrl, 'static-asset-body');
+
+    if (directStream) {
+      foundStream = directStream;
+      return;
+    }
+
+    const nestedApiUrls = extractApiProxyUrlsFromText(assetText, assetUrl);
+
+    for (const apiUrl of nestedApiUrls) {
+      if (foundStream) break;
+
+      foundStream = await fetchApiProxy(apiUrl, targetUrl, debug, 'static-asset-api');
+    }
+
+    if (foundStream) return;
+
+    const nestedAssets = extractAssetUrls(assetText, assetUrl, 10);
+
+    for (const nestedAsset of nestedAssets) {
+      if (foundStream) break;
+
+      debug.asset(nestedAsset);
+
+      if (isApiProxyUrl(nestedAsset)) {
+        foundStream = await fetchApiProxy(nestedAsset, targetUrl, debug, 'static-nested-api');
+      }
+    }
+  });
+
+  if (foundStream) {
     return {
       ok: true,
       movieId,
       sourceUrl: targetUrl,
-      result: first,
-      mode: 'static-html'
+      apiProxyUrl: foundStream.apiProxyUrl || null,
+      stream: foundStream,
+      mode: foundStream.foundIn || 'static-assets'
     };
   }
 
-  const assets = extractAssetUrls(html, targetUrl, debug);
-
-  await mapLimit(assets, 8, async (assetUrl) => {
-    if (firstProxyVideoOnly(found)) return;
-
-    debug.check(`static-asset-url:${assetUrl}`);
-
-    const direct = parseFoundUrl(assetUrl, 'static-asset-url', targetUrl);
-
-    if (direct) {
-      addParsedItems(found, [direct], debug);
-    }
-
-    if (firstProxyVideoOnly(found)) return;
-
-    const text = await fetchText(assetUrl, targetUrl, SCRIPT_TIMEOUT_MS);
-    first = addFoundFromText(found, text, 'static-asset-body', assetUrl, debug);
-
-    if (first) return;
-
-    const nestedAssets = extractAssetUrls(text, assetUrl, debug).slice(0, 8);
-
-    for (const nestedUrl of nestedAssets) {
-      if (firstProxyVideoOnly(found)) break;
-
-      const nestedText = await fetchText(nestedUrl, targetUrl, SCRIPT_TIMEOUT_MS);
-      addFoundFromText(found, nestedText, 'static-nested-asset', nestedUrl, debug);
-    }
-  });
-
-  first = firstProxyVideoOnly(found);
-
   return {
-    ok: Boolean(first),
+    ok: false,
     movieId,
     sourceUrl: targetUrl,
-    result: first,
-    mode: first ? 'static-assets' : 'static-none'
+    apiProxyUrl: null,
+    stream: null,
+    mode: 'static-none'
   };
-}
-
-function shouldReadResponseBody(url, contentType, headers = {}) {
-  const lowerUrl = String(url || '').toLowerCase();
-  const lowerType = String(contentType || '').toLowerCase();
-  const contentLength = Number(headers['content-length'] || 0);
-
-  if (contentLength && contentLength > RESPONSE_BODY_LIMIT_BYTES) return false;
-
-  return (
-    lowerType.includes('text/') ||
-    lowerType.includes('json') ||
-    lowerType.includes('javascript') ||
-    lowerType.includes('xml') ||
-    lowerType.includes('mpegurl') ||
-    lowerUrl.endsWith('.js') ||
-    lowerUrl.includes('.js?') ||
-    lowerUrl.endsWith('.json') ||
-    lowerUrl.includes('.json?') ||
-    lowerUrl.endsWith('.m3u8') ||
-    lowerUrl.includes('.m3u8?')
-  );
 }
 
 async function getBrowser() {
@@ -476,19 +383,20 @@ async function getSharedContext() {
   return contextPromise;
 }
 
-async function dumpFrames(page, found, targetUrl, debug, signal) {
+async function scanFrameContent(page, targetUrl, debug, signal, apiFetches, apiSeen) {
   for (const frame of page.frames()) {
-    if (firstProxyVideoOnly(found)) return;
-
     const frameUrl = frame.url();
     const base = frameUrl && frameUrl !== 'about:blank' ? frameUrl : targetUrl;
 
-    debug.check(`browser-frame:${base}`);
+    debug.check(`frame:${base}`);
 
     const html = await frame.content().catch(() => '');
-    addFoundFromText(found, html, 'browser-frame-html', base, debug, signal);
 
-    if (firstProxyVideoOnly(found)) return;
+    const apiUrls = extractApiProxyUrlsFromText(html, base);
+
+    for (const apiUrl of apiUrls) {
+      queueApiFetch(apiUrl, targetUrl, debug, signal, apiFetches, apiSeen, 'browser-frame-html');
+    }
 
     const storageText = await frame
       .evaluate(() => {
@@ -512,11 +420,39 @@ async function dumpFrames(page, found, targetUrl, debug, signal) {
       })
       .catch(() => '');
 
-    addFoundFromText(found, storageText, 'browser-storage', base, debug, signal);
+    const storageApiUrls = extractApiProxyUrlsFromText(storageText, base);
+
+    for (const apiUrl of storageApiUrls) {
+      queueApiFetch(apiUrl, targetUrl, debug, signal, apiFetches, apiSeen, 'browser-storage');
+    }
   }
 }
 
-async function clickPossiblePlayers(page, found, targetUrl, debug, signal) {
+function queueApiFetch(apiUrl, targetUrl, debug, signal, apiFetches, apiSeen, foundIn) {
+  if (!apiUrl || !isApiProxyUrl(apiUrl)) return;
+  if (apiSeen.has(apiUrl)) return;
+
+  apiSeen.add(apiUrl);
+  debug.api(apiUrl, foundIn);
+
+  const task = fetchApiProxy(apiUrl, targetUrl, debug, foundIn)
+    .then((stream) => {
+      if (stream) signal.resolve(stream);
+      return stream;
+    })
+    .catch(() => null)
+    .finally(() => apiFetches.delete(task));
+
+  apiFetches.add(task);
+}
+
+async function clickPlayer(page, debug) {
+  debug.check('click-player');
+
+  await page.mouse.click(640, 360).catch(() => {});
+  await page.keyboard.press('Space').catch(() => {});
+  await page.waitForTimeout(150).catch(() => {});
+
   const selectors = [
     'video',
     '.jw-icon-playback',
@@ -530,58 +466,25 @@ async function clickPossiblePlayers(page, found, targetUrl, debug, signal) {
     'svg'
   ];
 
-  debug.check('browser-click-center');
-
-  await page.mouse.click(640, 360).catch(() => {});
-  await page.keyboard.press('Space').catch(() => {});
-  await page.waitForTimeout(150).catch(() => {});
-
-  if (firstProxyVideoOnly(found)) return;
-
   for (const frame of page.frames()) {
     for (const selector of selectors) {
-      if (firstProxyVideoOnly(found)) return;
-
       const loc = frame.locator(selector).first();
       const count = await loc.count().catch(() => 0);
 
       if (!count) continue;
 
-      debug.check(`browser-click:${selector}`);
-
-      await loc
-        .click({
-          timeout: 350,
-          force: true
-        })
-        .catch(() => {});
-
-      await page.waitForTimeout(100).catch(() => {});
+      await loc.click({ timeout: 300, force: true }).catch(() => {});
+      await page.waitForTimeout(80).catch(() => {});
     }
   }
-
-  await dumpFrames(page, found, targetUrl, debug, signal).catch(() => {});
 }
 
 async function browserFallback(movieId, targetUrl, debug) {
-  const found = [];
-  const responseTasks = new Set();
   const signal = createFoundSignal();
+  const apiFetches = new Set();
+  const apiSeen = new Set();
 
   let page;
-
-  function addUrl(url, source, extra = {}) {
-    if (!url || !looksUseful(url)) return null;
-
-    debug.url(source, url, 'raw-useful-url');
-
-    const item = parseFoundUrl(url, source, targetUrl);
-
-    if (!item) return null;
-
-    const first = addParsedItems(found, [{ ...item, ...extra }], debug, signal);
-    return first;
-  }
 
   try {
     const context = await getSharedContext();
@@ -595,18 +498,11 @@ async function browserFallback(movieId, targetUrl, debug) {
       const url = request.url();
       const type = request.resourceType();
 
-      const first = addUrl(url, 'browser-route', {
-        method: request.method(),
-        resourceType: type
-      });
-
-      // Key speed trick:
-      // If the proxy URL appears, capture it, then abort so it does not download.
-      if (first) {
-        return route.abort().catch(() => {});
+      if (isApiProxyUrl(url)) {
+        queueApiFetch(url, targetUrl, debug, signal, apiFetches, apiSeen, 'browser-route-api');
       }
 
-      // Safe blocks only. Do not block scripts/xhr/fetch/media before checking URL.
+      // Safe blocking only. Do NOT block scripts/xhr/fetch.
       if (type === 'image' || type === 'font' || type === 'stylesheet') {
         return route.abort().catch(() => {});
       }
@@ -641,146 +537,121 @@ async function browserFallback(movieId, targetUrl, debug) {
     });
 
     page.on('console', (msg) => {
-      addFoundFromText(found, msg.text(), 'browser-console', targetUrl, debug, signal);
+      const apiUrls = extractApiProxyUrlsFromText(msg.text(), targetUrl);
+
+      for (const apiUrl of apiUrls) {
+        queueApiFetch(apiUrl, targetUrl, debug, signal, apiFetches, apiSeen, 'browser-console');
+      }
     });
 
     page.on('request', (request) => {
-      addUrl(request.url(), 'browser-request', {
-        method: request.method(),
-        resourceType: request.resourceType()
-      });
+      const url = request.url();
+
+      if (isApiProxyUrl(url)) {
+        queueApiFetch(url, targetUrl, debug, signal, apiFetches, apiSeen, 'browser-request-api');
+      }
 
       const postData = request.postData();
 
-      if (postData && looksUseful(postData)) {
-        addFoundFromText(found, postData, 'browser-post-data', targetUrl, debug, signal);
+      if (postData) {
+        const apiUrls = extractApiProxyUrlsFromText(postData, targetUrl);
+
+        for (const apiUrl of apiUrls) {
+          queueApiFetch(apiUrl, targetUrl, debug, signal, apiFetches, apiSeen, 'browser-post-data');
+        }
       }
     });
 
     page.on('response', (response) => {
       const task = (async () => {
         const url = response.url();
-        const headers = response.headers();
-        const contentType = headers['content-type'] || '';
 
-        addUrl(url, 'browser-response', {
-          status: response.status(),
-          contentType
-        });
+        if (isApiProxyUrl(url)) {
+          debug.api(url, 'browser-response-api');
 
-        if (firstProxyVideoOnly(found)) return;
-
-        if (shouldReadResponseBody(url, contentType, headers)) {
           const text = await response.text().catch(() => '');
-          addFoundFromText(found, text, 'browser-response-body', url, debug, signal);
+          const stream = parseM3u8FromApiResponse(text, url, 'browser-response-api');
+
+          if (stream) signal.resolve(stream);
         }
       })()
         .catch(() => {})
-        .finally(() => responseTasks.delete(task));
+        .finally(() => apiFetches.delete(task));
 
-      responseTasks.add(task);
+      apiFetches.add(task);
     });
 
     const safeTargetUrl = addHttpsToBareUrl(repairBrokenProtocol(targetUrl));
 
     debug.check('browser-goto');
 
-    const navPromise = page
+    await page
       .goto(safeTargetUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 14000
       })
       .catch(() => null);
 
-    let first = await Promise.race([
-      signal.promise,
-      navPromise.then(() => null),
-      sleep(BROWSER_FAST_WAIT_MS).then(() => null)
-    ]);
-
-    first = first || firstProxyVideoOnly(found);
-
-    if (first) {
-      return {
-        ok: true,
-        movieId,
-        sourceUrl: targetUrl,
-        result: first,
-        mode: 'browser-instant'
-      };
-    }
-
-    await dumpFrames(page, found, targetUrl, debug, signal).catch(() => {});
-
-    first = firstProxyVideoOnly(found);
-
-    if (first) {
-      return {
-        ok: true,
-        movieId,
-        sourceUrl: targetUrl,
-        result: first,
-        mode: 'browser-frame'
-      };
-    }
+    await scanFrameContent(page, targetUrl, debug, signal, apiFetches, apiSeen);
 
     let clicked = false;
-    let lastFrameDump = 0;
+    let lastFrameScan = 0;
     const start = Date.now();
     const end = start + BROWSER_TOTAL_WAIT_MS;
 
     while (Date.now() < end) {
-      first = firstProxyVideoOnly(found);
+      const winner = await Promise.race([
+        signal.promise,
+        sleep(250).then(() => null)
+      ]);
 
-      if (first) {
+      if (winner) {
         return {
           ok: true,
           movieId,
           sourceUrl: targetUrl,
-          result: first,
-          mode: 'browser-network'
+          apiProxyUrl: winner.apiProxyUrl || null,
+          stream: winner,
+          mode: winner.foundIn || 'browser-api'
         };
       }
 
       if (!clicked && Date.now() - start > CLICK_AFTER_MS) {
         clicked = true;
-        await clickPossiblePlayers(page, found, targetUrl, debug, signal);
+        await clickPlayer(page, debug);
       }
 
-      if (Date.now() - lastFrameDump > 900) {
-        lastFrameDump = Date.now();
-        await dumpFrames(page, found, targetUrl, debug, signal).catch(() => {});
+      if (Date.now() - lastFrameScan > 900) {
+        lastFrameScan = Date.now();
+        await scanFrameContent(page, targetUrl, debug, signal, apiFetches, apiSeen);
       }
+    }
 
-      first = await Promise.race([
-        signal.promise,
-        sleep(250).then(() => null)
-      ]);
+    const apiResults = await Promise.race([
+      Promise.allSettled([...apiFetches]),
+      sleep(1000).then(() => [])
+    ]).catch(() => []);
 
-      if (first) {
+    for (const result of apiResults || []) {
+      if (result?.status === 'fulfilled' && result.value) {
         return {
           ok: true,
           movieId,
           sourceUrl: targetUrl,
-          result: first,
-          mode: 'browser-signal'
+          apiProxyUrl: result.value.apiProxyUrl || null,
+          stream: result.value,
+          mode: result.value.foundIn || 'browser-api-final'
         };
       }
     }
 
-    await Promise.race([
-      Promise.allSettled([...responseTasks]),
-      sleep(700)
-    ]).catch(() => {});
-
-    first = firstProxyVideoOnly(found);
-
     return {
-      ok: Boolean(first),
+      ok: false,
       movieId,
       sourceUrl: targetUrl,
-      result: first,
-      mode: first ? 'browser-final' : 'browser-none'
+      apiProxyUrl: null,
+      stream: null,
+      mode: 'browser-none'
     };
   } finally {
     await page?.close().catch(() => {});
@@ -806,14 +677,6 @@ function getCacheState(movieId) {
   };
 }
 
-function withoutDebug(data) {
-  if (!data) return data;
-
-  const copy = { ...data };
-  delete copy.debug;
-  return copy;
-}
-
 function attachDebug(data, debug) {
   if (!debug.enabled) return data;
 
@@ -823,13 +686,19 @@ function attachDebug(data, debug) {
   };
 }
 
+function removeDebug(data) {
+  const copy = { ...data };
+  delete copy.debug;
+  return copy;
+}
+
 async function resolveMovie(movieId, debugEnabled = false) {
   const targetUrl = `https://embed.filmu.in/movie/${encodeURIComponent(movieId)}`;
   const debug = createDebug(debugEnabled);
 
   const staticResult = await staticResolve(movieId, targetUrl, debug);
 
-  if (staticResult.ok && staticResult.result) {
+  if (staticResult.ok && staticResult.stream) {
     return attachDebug(staticResult, debug);
   }
 
@@ -863,12 +732,12 @@ async function resolveMovieCached(movieId, options = {}) {
   const job = scanLimit(async () => {
     const scanned = await resolveMovie(movieId, debug);
 
-    if (scanned.ok && scanned.result) {
-      const cleanData = withoutDebug(scanned);
+    if (scanned.ok && scanned.stream) {
+      const clean = removeDebug(scanned);
 
       cache.set(movieId, {
         savedAt: Date.now(),
-        data: cleanData
+        data: clean
       });
 
       return {
@@ -878,14 +747,13 @@ async function resolveMovieCached(movieId, options = {}) {
       };
     }
 
-    // If fresh scan fails but stale cache exists, return stale instead of failing.
     if (!debug && existing?.data) {
       return {
         ...existing.data,
         cached: true,
         stale: true,
         cacheAgeMs: existing.ageMs,
-        cacheFallbackReason: 'Fresh scan failed, returned stale cached proxy.'
+        cacheFallbackReason: 'Fresh scan failed, returned stale cached m3u8.'
       };
     }
 
@@ -931,8 +799,8 @@ app.get('/movie/:id', async (req, res) => {
       debug: req.query.debug === '1'
     });
 
-    if (!scan.ok || !scan.result) {
-      return jsonError(res, 404, 'No proxy-video URL found.', {
+    if (!scan.ok || !scan.stream) {
+      return jsonError(res, 404, 'No m3u8 source found.', {
         movieId,
         sourceUrl: scan.sourceUrl,
         cached: Boolean(scan.cached),
@@ -953,12 +821,21 @@ app.get('/movie/:id', async (req, res) => {
       ms: Date.now() - startedAt,
       mode: scan.mode || null,
       sourceUrl: scan.sourceUrl,
-      proxyVideo: scan.result.workingUrl || scan.result.encodedProxyUrl || scan.result.url,
-      encodedProxyUrl: scan.result.encodedProxyUrl || scan.result.workingUrl || scan.result.url,
-      decodedVideoUrl: scan.result.decodedVideoUrl || null,
-      referer: scan.result.referer || null,
-      origin: scan.result.origin || null,
-      foundIn: scan.result.source || null,
+      apiProxyUrl: scan.apiProxyUrl || scan.stream.apiProxyUrl || null,
+
+      // main thing you need
+      m3u8: scan.stream.url,
+
+      stream: {
+        name: scan.stream.name,
+        url: scan.stream.url,
+        quality: scan.stream.quality,
+        type: scan.stream.type,
+        headers: scan.stream.headers || {}
+      },
+
+      headers: scan.stream.headers || {},
+      foundIn: scan.stream.foundIn || scan.mode || null,
       debug: scan.debug || undefined
     });
   } catch (error) {
