@@ -11,13 +11,20 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
-const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 3500);
-const SCRIPT_TIMEOUT_MS = Number(process.env.SCRIPT_TIMEOUT_MS || 2500);
-const MAX_ASSETS_TO_SCAN = Number(process.env.MAX_ASSETS_TO_SCAN || 35);
-const BROWSER_WAIT_MS = Number(process.env.BROWSER_WAIT_MS || 6000);
+const FRESH_CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
+const STALE_CACHE_TTL_MS = Number(process.env.STALE_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
+
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 2200);
+const SCRIPT_TIMEOUT_MS = Number(process.env.SCRIPT_TIMEOUT_MS || 1800);
+const MAX_ASSETS_TO_SCAN = Number(process.env.MAX_ASSETS_TO_SCAN || 30);
+
 const ENABLE_BROWSER_FALLBACK = process.env.ENABLE_BROWSER_FALLBACK !== '0';
+const BROWSER_FAST_WAIT_MS = Number(process.env.BROWSER_FAST_WAIT_MS || 1800);
+const BROWSER_TOTAL_WAIT_MS = Number(process.env.BROWSER_TOTAL_WAIT_MS || 7500);
+const CLICK_AFTER_MS = Number(process.env.CLICK_AFTER_MS || 1200);
+
 const RESPONSE_BODY_LIMIT_BYTES = Number(process.env.RESPONSE_BODY_LIMIT_BYTES || 2 * 1024 * 1024);
+const MAX_PARALLEL_SCANS = Number(process.env.MAX_PARALLEL_SCANS || 2);
 
 const cache = new Map();
 const pending = new Map();
@@ -31,12 +38,18 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
   if (req.method === 'OPTIONS') return res.sendStatus(204);
+
   next();
 });
 
 function jsonError(res, status, message, extra = {}) {
-  return res.status(status).json({ ok: false, error: message, ...extra });
+  return res.status(status).json({
+    ok: false,
+    error: message,
+    ...extra
+  });
 }
 
 function sleep(ms) {
@@ -64,16 +77,136 @@ function firstProxyVideoOnly(items) {
   return null;
 }
 
-function addFoundFromText(found, text, source, baseUrl) {
-  if (!text) return null;
+function createLimiter(max) {
+  let active = 0;
+  const queue = [];
 
-  const items = extractUrlsFromText(text, source, baseUrl);
-  found.push(...items);
+  async function run(fn, resolve, reject) {
+    active++;
+
+    try {
+      const value = await fn();
+      resolve(value);
+    } catch (error) {
+      reject(error);
+    } finally {
+      active--;
+
+      const next = queue.shift();
+      if (next) next();
+    }
+  }
+
+  return function limit(fn) {
+    return new Promise((resolve, reject) => {
+      const job = () => run(fn, resolve, reject);
+
+      if (active < max) {
+        job();
+      } else {
+        queue.push(job);
+      }
+    });
+  };
+}
+
+const scanLimit = createLimiter(MAX_PARALLEL_SCANS);
+
+function createFoundSignal() {
+  let resolved = false;
+  let resolveNow;
+
+  const promise = new Promise((resolve) => {
+    resolveNow = resolve;
+  });
+
+  return {
+    promise,
+    resolve(item) {
+      if (!resolved && item) {
+        resolved = true;
+        resolveNow(item);
+      }
+    }
+  };
+}
+
+function createDebug(enabled) {
+  const checked = [];
+  const usefulUrlsSeen = [];
+  const assetUrls = [];
+  const seenUrls = new Set();
+  const seenAssets = new Set();
+
+  return {
+    enabled,
+
+    check(name) {
+      if (!enabled) return;
+      if (checked.length < 150) checked.push(name);
+    },
+
+    url(source, url, note = '') {
+      if (!enabled || !url || !looksUseful(url)) return;
+
+      const key = `${source}|${url}`;
+      if (seenUrls.has(key)) return;
+
+      seenUrls.add(key);
+
+      if (usefulUrlsSeen.length < 120) {
+        usefulUrlsSeen.push({ source, url, note });
+      }
+    },
+
+    asset(url) {
+      if (!enabled || !url) return;
+      if (seenAssets.has(url)) return;
+
+      seenAssets.add(url);
+
+      if (assetUrls.length < 80) {
+        assetUrls.push(url);
+      }
+    },
+
+    data() {
+      return {
+        checked,
+        usefulUrlsSeen,
+        assetUrls
+      };
+    }
+  };
+}
+
+function addParsedItems(found, items, debug, signal) {
+  for (const item of items || []) {
+    found.push(item);
+    debug.url(item.source || 'parsed', item.url || item.workingUrl, 'parsed-proxy');
+
+    const first = firstProxyVideoOnly(found);
+
+    if (first && signal) {
+      signal.resolve(first);
+    }
+  }
 
   return firstProxyVideoOnly(found);
 }
 
+function addFoundFromText(found, text, source, baseUrl, debug, signal) {
+  debug.check(source);
+
+  if (!text) return firstProxyVideoOnly(found);
+
+  const items = extractUrlsFromText(text, source, baseUrl);
+  return addParsedItems(found, items, debug, signal);
+}
+
 function getHeaders(baseUrl) {
+  const origin = new URL(baseUrl).origin;
+
   return {
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -81,7 +214,7 @@ function getHeaders(baseUrl) {
       'text/html,application/xhtml+xml,application/xml;q=0.9,text/javascript,application/javascript,application/json,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
     Referer: baseUrl,
-    Origin: new URL(baseUrl).origin
+    Origin: origin
   };
 }
 
@@ -97,15 +230,24 @@ async function fetchText(url, baseUrl, timeoutMs) {
     });
 
     const contentType = response.headers.get('content-type') || '';
+    const lowerType = contentType.toLowerCase();
+    const lowerUrl = url.toLowerCase();
 
-    if (
-      !contentType.includes('text') &&
-      !contentType.includes('javascript') &&
-      !contentType.includes('json') &&
-      !contentType.includes('html') &&
-      !contentType.includes('xml') &&
-      !contentType.includes('mpegurl')
-    ) {
+    const blockedType =
+      lowerType.includes('image') ||
+      lowerType.includes('font') ||
+      lowerType.includes('video');
+
+    const usefulFile =
+      lowerUrl.includes('.js') ||
+      lowerUrl.includes('.json') ||
+      lowerUrl.includes('.m3u8') ||
+      lowerUrl.includes('proxy') ||
+      lowerUrl.includes('player') ||
+      lowerUrl.includes('embed') ||
+      lowerUrl.includes('api');
+
+    if (blockedType && !usefulFile) {
       return '';
     }
 
@@ -117,17 +259,35 @@ async function fetchText(url, baseUrl, timeoutMs) {
   }
 }
 
-function uniquePush(set, url) {
-  if (!url) return;
+function addAsset(set, raw, baseUrl, debug) {
+  if (!raw) return;
 
   try {
-    const clean = addHttpsToBareUrl(repairBrokenProtocol(String(url).trim()));
-    if (clean) set.add(clean);
+    const fixed = addHttpsToBareUrl(repairBrokenProtocol(String(raw).trim()));
+    const absolute = new URL(fixed, baseUrl).toString();
+    const lower = absolute.toLowerCase();
+
+    const useful =
+      lower.includes('proxy') ||
+      lower.includes('player') ||
+      lower.includes('embed') ||
+      lower.includes('/api') ||
+      lower.includes('/movie') ||
+      lower.includes('filmu') ||
+      lower.includes('.js') ||
+      lower.includes('.json') ||
+      lower.includes('.m3u8');
+
+    if (!useful) return;
+
+    set.add(absolute);
+    debug.asset(absolute);
   } catch {}
 }
 
-function extractAssetUrls(html, baseUrl) {
+function extractAssetUrls(html, baseUrl, debug) {
   const urls = new Set();
+  const text = String(html || '');
 
   const patterns = [
     /<script[^>]+src=["']([^"']+)["']/gi,
@@ -135,17 +295,13 @@ function extractAssetUrls(html, baseUrl) {
     /<source[^>]+src=["']([^"']+)["']/gi,
     /<(?:link|a)[^>]+href=["']([^"']+)["']/gi,
     /["']([^"']+\.(?:js|json|m3u8)(?:\?[^"']*)?)["']/gi,
-    /["'](\/[^"']*(?:proxy|video|embed|player|movie|api)[^"']*)["']/gi
+    /["'](\/[^"']*(?:proxy|video|embed|player|movie|api)[^"']*)["']/gi,
+    /(?:fetch|open)\(\s*["']([^"']+)["']/gi
   ];
 
   for (const pattern of patterns) {
-    for (const match of html.matchAll(pattern)) {
-      const raw = match[1];
-
-      try {
-        const absolute = new URL(raw, baseUrl).toString();
-        uniquePush(urls, absolute);
-      } catch {}
+    for (const match of text.matchAll(pattern)) {
+      addAsset(urls, match[1], baseUrl, debug);
     }
   }
 
@@ -153,25 +309,25 @@ function extractAssetUrls(html, baseUrl) {
 }
 
 async function mapLimit(items, limit, mapper) {
-  const results = [];
   let index = 0;
 
   async function worker() {
     while (index < items.length) {
-      const current = items[index++];
-      results.push(await mapper(current).catch(() => null));
+      const item = items[index++];
+      await mapper(item).catch(() => null);
     }
   }
 
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
 }
 
-async function staticResolve(movieId, targetUrl) {
+async function staticResolve(movieId, targetUrl, debug) {
   const found = [];
 
+  debug.check('static-html-fetch');
+
   const html = await fetchText(targetUrl, targetUrl, HTTP_TIMEOUT_MS);
-  let first = addFoundFromText(found, html, 'static-html', targetUrl);
+  let first = addFoundFromText(found, html, 'static-html', targetUrl, debug);
 
   if (first) {
     return {
@@ -183,49 +339,44 @@ async function staticResolve(movieId, targetUrl) {
     };
   }
 
-  const assets = extractAssetUrls(html, targetUrl);
+  const assets = extractAssetUrls(html, targetUrl, debug);
 
   await mapLimit(assets, 8, async (assetUrl) => {
     if (firstProxyVideoOnly(found)) return;
 
-    const parsedDirect = parseFoundUrl(assetUrl, 'static-asset-url', targetUrl);
-    if (parsedDirect) found.push(parsedDirect);
+    debug.check(`static-asset-url:${assetUrl}`);
+
+    const direct = parseFoundUrl(assetUrl, 'static-asset-url', targetUrl);
+
+    if (direct) {
+      addParsedItems(found, [direct], debug);
+    }
 
     if (firstProxyVideoOnly(found)) return;
 
     const text = await fetchText(assetUrl, targetUrl, SCRIPT_TIMEOUT_MS);
-    addFoundFromText(found, text, 'static-asset-body', assetUrl);
+    first = addFoundFromText(found, text, 'static-asset-body', assetUrl, debug);
 
-    if (text) {
-      const nestedAssets = extractAssetUrls(text, assetUrl).slice(0, 8);
+    if (first) return;
 
-      for (const nested of nestedAssets) {
-        if (firstProxyVideoOnly(found)) break;
+    const nestedAssets = extractAssetUrls(text, assetUrl, debug).slice(0, 8);
 
-        const nestedText = await fetchText(nested, targetUrl, SCRIPT_TIMEOUT_MS);
-        addFoundFromText(found, nestedText, 'static-nested-asset', nested);
-      }
+    for (const nestedUrl of nestedAssets) {
+      if (firstProxyVideoOnly(found)) break;
+
+      const nestedText = await fetchText(nestedUrl, targetUrl, SCRIPT_TIMEOUT_MS);
+      addFoundFromText(found, nestedText, 'static-nested-asset', nestedUrl, debug);
     }
   });
 
   first = firstProxyVideoOnly(found);
 
-  if (first) {
-    return {
-      ok: true,
-      movieId,
-      sourceUrl: targetUrl,
-      result: first,
-      mode: 'static-assets'
-    };
-  }
-
   return {
-    ok: false,
+    ok: Boolean(first),
     movieId,
     sourceUrl: targetUrl,
-    result: null,
-    mode: 'static-none'
+    result: first,
+    mode: first ? 'static-assets' : 'static-none'
   };
 }
 
@@ -265,6 +416,9 @@ async function getBrowser() {
           '--disable-background-networking',
           '--disable-background-timer-throttling',
           '--disable-renderer-backgrounding',
+          '--disable-sync',
+          '--disable-default-apps',
+          '--disable-popup-blocking',
           '--no-first-run',
           '--no-default-browser-check',
           '--autoplay-policy=no-user-gesture-required'
@@ -322,13 +476,19 @@ async function getSharedContext() {
   return contextPromise;
 }
 
-async function dumpFrames(page, found, targetUrl) {
+async function dumpFrames(page, found, targetUrl, debug, signal) {
   for (const frame of page.frames()) {
+    if (firstProxyVideoOnly(found)) return;
+
     const frameUrl = frame.url();
     const base = frameUrl && frameUrl !== 'about:blank' ? frameUrl : targetUrl;
 
+    debug.check(`browser-frame:${base}`);
+
     const html = await frame.content().catch(() => '');
-    addFoundFromText(found, html, 'browser-frame', base);
+    addFoundFromText(found, html, 'browser-frame-html', base, debug, signal);
+
+    if (firstProxyVideoOnly(found)) return;
 
     const storageText = await frame
       .evaluate(() => {
@@ -352,17 +512,76 @@ async function dumpFrames(page, found, targetUrl) {
       })
       .catch(() => '');
 
-    addFoundFromText(found, storageText, 'browser-storage', base);
-
-    if (firstProxyVideoOnly(found)) return;
+    addFoundFromText(found, storageText, 'browser-storage', base, debug, signal);
   }
 }
 
-async function browserFallback(movieId, targetUrl) {
+async function clickPossiblePlayers(page, found, targetUrl, debug, signal) {
+  const selectors = [
+    'video',
+    '.jw-icon-playback',
+    '.vjs-big-play-button',
+    '.plyr__control',
+    "[aria-label*='play' i]",
+    "[class*='play' i]",
+    "[id*='play' i]",
+    "[role='button']",
+    'button',
+    'svg'
+  ];
+
+  debug.check('browser-click-center');
+
+  await page.mouse.click(640, 360).catch(() => {});
+  await page.keyboard.press('Space').catch(() => {});
+  await page.waitForTimeout(150).catch(() => {});
+
+  if (firstProxyVideoOnly(found)) return;
+
+  for (const frame of page.frames()) {
+    for (const selector of selectors) {
+      if (firstProxyVideoOnly(found)) return;
+
+      const loc = frame.locator(selector).first();
+      const count = await loc.count().catch(() => 0);
+
+      if (!count) continue;
+
+      debug.check(`browser-click:${selector}`);
+
+      await loc
+        .click({
+          timeout: 350,
+          force: true
+        })
+        .catch(() => {});
+
+      await page.waitForTimeout(100).catch(() => {});
+    }
+  }
+
+  await dumpFrames(page, found, targetUrl, debug, signal).catch(() => {});
+}
+
+async function browserFallback(movieId, targetUrl, debug) {
   const found = [];
   const responseTasks = new Set();
+  const signal = createFoundSignal();
 
   let page;
+
+  function addUrl(url, source, extra = {}) {
+    if (!url || !looksUseful(url)) return null;
+
+    debug.url(source, url, 'raw-useful-url');
+
+    const item = parseFoundUrl(url, source, targetUrl);
+
+    if (!item) return null;
+
+    const first = addParsedItems(found, [{ ...item, ...extra }], debug, signal);
+    return first;
+  }
 
   try {
     const context = await getSharedContext();
@@ -376,13 +595,19 @@ async function browserFallback(movieId, targetUrl) {
       const url = request.url();
       const type = request.resourceType();
 
-      if (looksUseful(url)) {
-        const item = parseFoundUrl(url, 'browser-route', targetUrl);
-        if (item) found.push({ ...item, method: request.method(), resourceType: type });
+      const first = addUrl(url, 'browser-route', {
+        method: request.method(),
+        resourceType: type
+      });
+
+      // Key speed trick:
+      // If the proxy URL appears, capture it, then abort so it does not download.
+      if (first) {
+        return route.abort().catch(() => {});
       }
 
-      // Safe blocking only. Do not block media/script/xhr/fetch.
-      if (type === 'image' || type === 'font') {
+      // Safe blocks only. Do not block scripts/xhr/fetch/media before checking URL.
+      if (type === 'image' || type === 'font' || type === 'stylesheet') {
         return route.abort().catch(() => {});
       }
 
@@ -416,21 +641,19 @@ async function browserFallback(movieId, targetUrl) {
     });
 
     page.on('console', (msg) => {
-      addFoundFromText(found, msg.text(), 'browser-console', targetUrl);
+      addFoundFromText(found, msg.text(), 'browser-console', targetUrl, debug, signal);
     });
 
     page.on('request', (request) => {
-      const url = request.url();
-
-      if (looksUseful(url)) {
-        const item = parseFoundUrl(url, 'browser-request', targetUrl);
-        if (item) found.push({ ...item, method: request.method(), resourceType: request.resourceType() });
-      }
+      addUrl(request.url(), 'browser-request', {
+        method: request.method(),
+        resourceType: request.resourceType()
+      });
 
       const postData = request.postData();
 
       if (postData && looksUseful(postData)) {
-        addFoundFromText(found, postData, 'browser-post-data', targetUrl);
+        addFoundFromText(found, postData, 'browser-post-data', targetUrl, debug, signal);
       }
     });
 
@@ -440,20 +663,16 @@ async function browserFallback(movieId, targetUrl) {
         const headers = response.headers();
         const contentType = headers['content-type'] || '';
 
-        if (
-          looksUseful(url) ||
-          String(contentType).includes('video') ||
-          String(contentType).includes('mpegurl')
-        ) {
-          const item = parseFoundUrl(url, 'browser-response', targetUrl);
-          if (item) found.push({ ...item, status: response.status(), contentType });
-        }
+        addUrl(url, 'browser-response', {
+          status: response.status(),
+          contentType
+        });
 
         if (firstProxyVideoOnly(found)) return;
 
         if (shouldReadResponseBody(url, contentType, headers)) {
           const text = await response.text().catch(() => '');
-          addFoundFromText(found, text, 'browser-response-body', url);
+          addFoundFromText(found, text, 'browser-response-body', url, debug, signal);
         }
       })()
         .catch(() => {})
@@ -462,16 +681,38 @@ async function browserFallback(movieId, targetUrl) {
       responseTasks.add(task);
     });
 
-    await page
-      .goto(targetUrl, {
+    const safeTargetUrl = addHttpsToBareUrl(repairBrokenProtocol(targetUrl));
+
+    debug.check('browser-goto');
+
+    const navPromise = page
+      .goto(safeTargetUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 14000
       })
       .catch(() => null);
 
-    await dumpFrames(page, found, targetUrl).catch(() => {});
+    let first = await Promise.race([
+      signal.promise,
+      navPromise.then(() => null),
+      sleep(BROWSER_FAST_WAIT_MS).then(() => null)
+    ]);
 
-    let first = firstProxyVideoOnly(found);
+    first = first || firstProxyVideoOnly(found);
+
+    if (first) {
+      return {
+        ok: true,
+        movieId,
+        sourceUrl: targetUrl,
+        result: first,
+        mode: 'browser-instant'
+      };
+    }
+
+    await dumpFrames(page, found, targetUrl, debug, signal).catch(() => {});
+
+    first = firstProxyVideoOnly(found);
 
     if (first) {
       return {
@@ -483,10 +724,10 @@ async function browserFallback(movieId, targetUrl) {
       };
     }
 
-    await page.mouse.click(640, 360).catch(() => {});
-    await page.keyboard.press('Space').catch(() => {});
-
-    const end = Date.now() + BROWSER_WAIT_MS;
+    let clicked = false;
+    let lastFrameDump = 0;
+    const start = Date.now();
+    const end = start + BROWSER_TOTAL_WAIT_MS;
 
     while (Date.now() < end) {
       first = firstProxyVideoOnly(found);
@@ -501,9 +742,20 @@ async function browserFallback(movieId, targetUrl) {
         };
       }
 
-      await dumpFrames(page, found, targetUrl).catch(() => {});
+      if (!clicked && Date.now() - start > CLICK_AFTER_MS) {
+        clicked = true;
+        await clickPossiblePlayers(page, found, targetUrl, debug, signal);
+      }
 
-      first = firstProxyVideoOnly(found);
+      if (Date.now() - lastFrameDump > 900) {
+        lastFrameDump = Date.now();
+        await dumpFrames(page, found, targetUrl, debug, signal).catch(() => {});
+      }
+
+      first = await Promise.race([
+        signal.promise,
+        sleep(250).then(() => null)
+      ]);
 
       if (first) {
         return {
@@ -511,15 +763,15 @@ async function browserFallback(movieId, targetUrl) {
           movieId,
           sourceUrl: targetUrl,
           result: first,
-          mode: 'browser-dump'
+          mode: 'browser-signal'
         };
       }
-
-      await Promise.race([
-        Promise.allSettled([...responseTasks]),
-        sleep(350)
-      ]).catch(() => {});
     }
+
+    await Promise.race([
+      Promise.allSettled([...responseTasks]),
+      sleep(700)
+    ]).catch(() => {});
 
     first = firstProxyVideoOnly(found);
 
@@ -528,74 +780,136 @@ async function browserFallback(movieId, targetUrl) {
       movieId,
       sourceUrl: targetUrl,
       result: first,
-      mode: 'browser-final'
+      mode: first ? 'browser-final' : 'browser-none'
     };
   } finally {
     await page?.close().catch(() => {});
   }
 }
 
-function cached(movieId) {
+function getCacheState(movieId) {
   const item = cache.get(movieId);
 
   if (!item) return null;
 
-  if (Date.now() - item.savedAt > CACHE_TTL_MS) {
+  const ageMs = Date.now() - item.savedAt;
+
+  if (ageMs > STALE_CACHE_TTL_MS) {
     cache.delete(movieId);
     return null;
   }
 
-  return item.data;
+  return {
+    data: item.data,
+    ageMs,
+    fresh: ageMs <= FRESH_CACHE_TTL_MS
+  };
 }
 
-async function resolveMovie(movieId) {
-  const targetUrl = `https://embed.filmu.in/movie/${encodeURIComponent(movieId)}`;
+function withoutDebug(data) {
+  if (!data) return data;
 
-  const staticResult = await staticResolve(movieId, targetUrl);
+  const copy = { ...data };
+  delete copy.debug;
+  return copy;
+}
+
+function attachDebug(data, debug) {
+  if (!debug.enabled) return data;
+
+  return {
+    ...data,
+    debug: debug.data()
+  };
+}
+
+async function resolveMovie(movieId, debugEnabled = false) {
+  const targetUrl = `https://embed.filmu.in/movie/${encodeURIComponent(movieId)}`;
+  const debug = createDebug(debugEnabled);
+
+  const staticResult = await staticResolve(movieId, targetUrl, debug);
 
   if (staticResult.ok && staticResult.result) {
-    return staticResult;
+    return attachDebug(staticResult, debug);
   }
 
   if (!ENABLE_BROWSER_FALLBACK) {
-    return staticResult;
+    return attachDebug(staticResult, debug);
   }
 
-  return browserFallback(movieId, targetUrl);
+  const browserResult = await browserFallback(movieId, targetUrl, debug);
+  return attachDebug(browserResult, debug);
 }
 
-async function resolveMovieCached(movieId, refresh = false) {
-  if (!refresh) {
-    const hit = cached(movieId);
+async function resolveMovieCached(movieId, options = {}) {
+  const refresh = Boolean(options.refresh);
+  const debug = Boolean(options.debug);
 
-    if (hit) {
-      return { ...hit, cached: true };
-    }
+  const existing = getCacheState(movieId);
+
+  if (!debug && !refresh && existing?.fresh) {
+    return {
+      ...existing.data,
+      cached: true,
+      stale: false,
+      cacheAgeMs: existing.ageMs
+    };
   }
 
-  if (pending.has(movieId)) return pending.get(movieId);
+  if (!debug && pending.has(movieId)) {
+    return pending.get(movieId);
+  }
 
-  const job = resolveMovie(movieId)
-    .then((data) => {
-      if (data.ok && data.result) {
-        cache.set(movieId, {
-          savedAt: Date.now(),
-          data
-        });
-      }
+  const job = scanLimit(async () => {
+    const scanned = await resolveMovie(movieId, debug);
 
-      return { ...data, cached: false };
-    })
-    .finally(() => pending.delete(movieId));
+    if (scanned.ok && scanned.result) {
+      const cleanData = withoutDebug(scanned);
 
-  pending.set(movieId, job);
+      cache.set(movieId, {
+        savedAt: Date.now(),
+        data: cleanData
+      });
+
+      return {
+        ...scanned,
+        cached: false,
+        stale: false
+      };
+    }
+
+    // If fresh scan fails but stale cache exists, return stale instead of failing.
+    if (!debug && existing?.data) {
+      return {
+        ...existing.data,
+        cached: true,
+        stale: true,
+        cacheAgeMs: existing.ageMs,
+        cacheFallbackReason: 'Fresh scan failed, returned stale cached proxy.'
+      };
+    }
+
+    return {
+      ...scanned,
+      cached: false,
+      stale: false
+    };
+  });
+
+  if (!debug) {
+    pending.set(movieId, job);
+    job.finally(() => pending.delete(movieId));
+  }
+
   return job;
 }
 
 app.get('/', (_req, res) => {
   res
     .type('text/plain')
-    .send('MovieResolver API\n\nUse: GET /movie/{number}\nExample: /movie/1726\nRefresh: /movie/1726?refresh=1\n');
+    .send(
+      'MovieResolver API\n\nUse: GET /movie/{number}\nExample: /movie/1726\nRefresh: /movie/1726?refresh=1\nDebug: /movie/1726?debug=1\n'
+    );
 });
 
 app.get('/healthz', (_req, res) => {
@@ -612,15 +926,20 @@ app.get('/movie/:id', async (req, res) => {
   const startedAt = Date.now();
 
   try {
-    const scan = await resolveMovieCached(movieId, req.query.refresh === '1');
+    const scan = await resolveMovieCached(movieId, {
+      refresh: req.query.refresh === '1',
+      debug: req.query.debug === '1'
+    });
 
     if (!scan.ok || !scan.result) {
       return jsonError(res, 404, 'No proxy-video URL found.', {
         movieId,
         sourceUrl: scan.sourceUrl,
         cached: Boolean(scan.cached),
+        stale: Boolean(scan.stale),
         ms: Date.now() - startedAt,
-        mode: scan.mode || null
+        mode: scan.mode || null,
+        debug: scan.debug || undefined
       });
     }
 
@@ -628,6 +947,9 @@ app.get('/movie/:id', async (req, res) => {
       ok: true,
       movieId,
       cached: Boolean(scan.cached),
+      stale: Boolean(scan.stale),
+      cacheAgeMs: scan.cacheAgeMs || 0,
+      cacheFallbackReason: scan.cacheFallbackReason || undefined,
       ms: Date.now() - startedAt,
       mode: scan.mode || null,
       sourceUrl: scan.sourceUrl,
@@ -636,7 +958,8 @@ app.get('/movie/:id', async (req, res) => {
       decodedVideoUrl: scan.result.decodedVideoUrl || null,
       referer: scan.result.referer || null,
       origin: scan.result.origin || null,
-      foundIn: scan.result.source || null
+      foundIn: scan.result.source || null,
+      debug: scan.debug || undefined
     });
   } catch (error) {
     return jsonError(res, 500, error.message || 'Scan failed.', {
@@ -653,7 +976,7 @@ const server = app.listen(PORT, () => {
   console.log(`MovieResolver API running on port ${PORT}`);
 
   getSharedContext()
-    .then(() => console.log('Chromium fallback warmed up'))
+    .then(() => console.log('Chromium warmed up'))
     .catch((error) => console.error('Chromium warmup failed:', error.message));
 });
 
