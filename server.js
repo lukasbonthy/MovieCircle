@@ -11,13 +11,13 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Faster defaults
-const FIRST_PASS_WAIT_MS = Number(process.env.FIRST_PASS_WAIT_MS || 700);
-const AFTER_CLICK_WAIT_MS = Number(process.env.AFTER_CLICK_WAIT_MS || 1200);
-const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 12000);
+// Faster, but still reliable
+const FIRST_PASS_WAIT_MS = Number(process.env.FIRST_PASS_WAIT_MS || 2200);
+const AFTER_CLICK_WAIT_MS = Number(process.env.AFTER_CLICK_WAIT_MS || 2600);
+const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 18000);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
-const RESPONSE_BODY_LIMIT_BYTES = Number(process.env.RESPONSE_BODY_LIMIT_BYTES || 500 * 1024);
-const STATIC_FETCH_TIMEOUT_MS = Number(process.env.STATIC_FETCH_TIMEOUT_MS || 700);
+const RESPONSE_BODY_LIMIT_BYTES = Number(process.env.RESPONSE_BODY_LIMIT_BYTES || 4 * 1024 * 1024);
+const STATIC_FETCH_TIMEOUT_MS = Number(process.env.STATIC_FETCH_TIMEOUT_MS || 1000);
 
 const cache = new Map();
 const pending = new Map();
@@ -70,47 +70,6 @@ function firstProxyVideoOnly(items) {
   return null;
 }
 
-function createProxyCollector(found) {
-  let resolved = false;
-  let resolveFirst;
-
-  const promise = new Promise((resolve) => {
-    resolveFirst = resolve;
-  });
-
-  function check() {
-    const first = firstProxyVideoOnly(found);
-
-    if (first && !resolved) {
-      resolved = true;
-      resolveFirst(first);
-    }
-
-    return first;
-  }
-
-  function add(item) {
-    if (!item) return null;
-    found.push(item);
-    return check();
-  }
-
-  function addMany(items) {
-    for (const item of items || []) {
-      add(item);
-    }
-
-    return check();
-  }
-
-  return {
-    promise,
-    add,
-    addMany,
-    check
-  };
-}
-
 function shouldReadResponseBody(url, contentType, headers = {}) {
   const lowerUrl = String(url || '').toLowerCase();
   const lowerType = String(contentType || '').toLowerCase();
@@ -149,9 +108,6 @@ async function getBrowser() {
           '--disable-background-networking',
           '--disable-background-timer-throttling',
           '--disable-renderer-backgrounding',
-          '--disable-sync',
-          '--disable-default-apps',
-          '--disable-popup-blocking',
           '--no-first-run',
           '--no-default-browser-check',
           '--autoplay-policy=no-user-gesture-required'
@@ -212,7 +168,7 @@ async function getSharedContext() {
   return contextPromise;
 }
 
-async function dumpFrameContent(page, baseUrl, found, collector) {
+async function dumpFrameContent(page, baseUrl, found) {
   for (const frame of page.frames()) {
     const frameUrl = frame.url();
     const frameBase = frameUrl && frameUrl !== 'about:blank' ? frameUrl : baseUrl;
@@ -220,10 +176,8 @@ async function dumpFrameContent(page, baseUrl, found, collector) {
     const html = await frame.content().catch(() => '');
 
     if (html) {
-      collector.addMany(extractUrlsFromText(html, 'frame-html', frameBase));
+      found.push(...extractUrlsFromText(html, 'frame-html', frameBase));
     }
-
-    if (collector.check()) return;
 
     const storageText = await frame
       .evaluate(() => {
@@ -248,14 +202,50 @@ async function dumpFrameContent(page, baseUrl, found, collector) {
       .catch(() => '');
 
     if (storageText) {
-      collector.addMany(extractUrlsFromText(storageText, 'browser-storage', frameBase));
+      found.push(...extractUrlsFromText(storageText, 'browser-storage', frameBase));
     }
-
-    if (collector.check()) return;
   }
 }
 
-async function clickPossiblePlayers(page, found, targetUrl, collector) {
+async function waitForFirst(page, found, baseUrl, ms, responseTasks) {
+  const end = Date.now() + ms;
+  let lastDump = 0;
+
+  while (Date.now() < end) {
+    const first = firstProxyVideoOnly(found);
+
+    if (first) {
+      return first;
+    }
+
+    const now = Date.now();
+
+    if (now - lastDump > 700) {
+      lastDump = now;
+
+      await dumpFrameContent(page, baseUrl, found).catch(() => {});
+
+      const afterDump = firstProxyVideoOnly(found);
+
+      if (afterDump) {
+        return afterDump;
+      }
+    }
+
+    if (responseTasks.size) {
+      await Promise.race([
+        Promise.allSettled([...responseTasks]),
+        page.waitForTimeout(100).catch(() => {})
+      ]).catch(() => {});
+    } else {
+      await page.waitForTimeout(130).catch(() => {});
+    }
+  }
+
+  return firstProxyVideoOnly(found);
+}
+
+async function clickPossiblePlayers(page, found, targetUrl) {
   const selectors = [
     'video',
     '.jw-icon-playback',
@@ -265,18 +255,19 @@ async function clickPossiblePlayers(page, found, targetUrl, collector) {
     "[class*='play' i]",
     "[id*='play' i]",
     "[role='button']",
-    'button'
+    'button',
+    'svg'
   ];
 
   await page.mouse.click(640, 360).catch(() => {});
   await page.keyboard.press('Space').catch(() => {});
-  await page.waitForTimeout(150).catch(() => {});
+  await page.waitForTimeout(300).catch(() => {});
 
-  if (collector.check()) return;
+  if (firstProxyVideoOnly(found)) return;
 
   for (const frame of page.frames()) {
     for (const selector of selectors) {
-      if (collector.check()) return;
+      if (firstProxyVideoOnly(found)) return;
 
       const loc = frame.locator(selector).first();
       const count = await loc.count().catch(() => 0);
@@ -285,16 +276,16 @@ async function clickPossiblePlayers(page, found, targetUrl, collector) {
 
       await loc
         .click({
-          timeout: 250,
+          timeout: 400,
           force: true
         })
         .catch(() => {});
 
-      await page.waitForTimeout(80).catch(() => {});
+      await page.waitForTimeout(160).catch(() => {});
     }
   }
 
-  await dumpFrameContent(page, targetUrl, found, collector).catch(() => {});
+  await dumpFrameContent(page, targetUrl, found).catch(() => {});
 }
 
 function cached(movieId) {
@@ -312,7 +303,7 @@ function cached(movieId) {
   return item.data;
 }
 
-async function tryStaticFetch(targetUrl, found, collector) {
+async function tryStaticFetch(targetUrl, found) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), STATIC_FETCH_TIMEOUT_MS);
 
@@ -331,7 +322,7 @@ async function tryStaticFetch(targetUrl, found, collector) {
     const text = await response.text().catch(() => '');
 
     if (text) {
-      collector.addMany(extractUrlsFromText(text, 'static-fetch', targetUrl));
+      found.push(...extractUrlsFromText(text, 'static-fetch', targetUrl));
     }
   } catch {
     // Chromium scan handles it.
@@ -344,19 +335,12 @@ async function resolveMovie(movieId) {
   const targetUrl = `https://embed.filmu.in/movie/${encodeURIComponent(movieId)}`;
   const found = [];
   const responseTasks = new Set();
-  const collector = createProxyCollector(found);
 
   let page;
 
-  const direct = parseFoundUrl(targetUrl, 'input-url', targetUrl);
+  await tryStaticFetch(targetUrl, found);
 
-  if (direct && looksUseful(direct.url)) {
-    collector.add(direct);
-  }
-
-  await tryStaticFetch(targetUrl, found, collector);
-
-  let first = collector.check();
+  let first = firstProxyVideoOnly(found);
 
   if (first) {
     return {
@@ -373,39 +357,28 @@ async function resolveMovie(movieId) {
     page = await context.newPage();
 
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
-    page.setDefaultTimeout(3000);
-
-    function addUrl(url, source, extra = {}) {
-      if (!url || !looksUseful(url)) return;
-
-      const item = parseFoundUrl(url, source, targetUrl);
-
-      if (item) {
-        collector.add({
-          ...item,
-          ...extra
-        });
-      }
-    }
+    page.setDefaultTimeout(5000);
 
     await page.route('**/*', async (route) => {
       const request = route.request();
       const url = request.url();
       const type = request.resourceType();
 
-      addUrl(url, 'network-route', {
-        method: request.method(),
-        resourceType: type
-      });
+      if (looksUseful(url)) {
+        const item = parseFoundUrl(url, 'network-route', targetUrl);
 
-      // Capture URLs, then block heavy downloads.
-      // Do NOT block script/xhr/fetch because those usually reveal the proxy.
-      if (
-        type === 'image' ||
-        type === 'font' ||
-        type === 'stylesheet' ||
-        type === 'media'
-      ) {
+        if (item) {
+          found.push({
+            ...item,
+            method: request.method(),
+            resourceType: type
+          });
+        }
+      }
+
+      // Safe blocking only.
+      // Do NOT block media, script, xhr, fetch, or stylesheet.
+      if (type === 'image' || type === 'font') {
         return route.abort().catch(() => {});
       }
 
@@ -439,21 +412,28 @@ async function resolveMovie(movieId) {
     });
 
     page.on('console', (msg) => {
-      collector.addMany(extractUrlsFromText(msg.text(), 'console', targetUrl));
+      found.push(...extractUrlsFromText(msg.text(), 'console', targetUrl));
     });
 
     page.on('request', (request) => {
       const url = request.url();
 
-      addUrl(url, 'network-request', {
-        method: request.method(),
-        resourceType: request.resourceType()
-      });
+      if (looksUseful(url)) {
+        const item = parseFoundUrl(url, 'network-request', targetUrl);
+
+        if (item) {
+          found.push({
+            ...item,
+            method: request.method(),
+            resourceType: request.resourceType()
+          });
+        }
+      }
 
       const postData = request.postData();
 
       if (postData && looksUseful(postData)) {
-        collector.addMany(extractUrlsFromText(postData, 'request-post-data', targetUrl));
+        found.push(...extractUrlsFromText(postData, 'request-post-data', targetUrl));
       }
     });
 
@@ -463,19 +443,29 @@ async function resolveMovie(movieId) {
         const headers = response.headers();
         const contentType = headers['content-type'] || '';
 
-        addUrl(url, 'network-response', {
-          status: response.status(),
-          contentType
-        });
+        if (
+          looksUseful(url) ||
+          String(contentType).includes('video') ||
+          String(contentType).includes('mpegurl')
+        ) {
+          const item = parseFoundUrl(url, 'network-response', targetUrl);
 
-        // Save time. Only scan response body if we still have not found proxy-video.
-        if (collector.check()) return;
+          if (item) {
+            found.push({
+              ...item,
+              status: response.status(),
+              contentType
+            });
+          }
+        }
+
+        if (firstProxyVideoOnly(found)) return;
 
         if (shouldReadResponseBody(url, contentType, headers)) {
           const text = await response.text().catch(() => '');
 
           if (text) {
-            collector.addMany(extractUrlsFromText(text, 'response-body', url));
+            found.push(...extractUrlsFromText(text, 'response-body', url));
           }
         }
       })()
@@ -487,22 +477,20 @@ async function resolveMovie(movieId) {
 
     const safeTargetUrl = addHttpsToBareUrl(repairBrokenProtocol(targetUrl));
 
-    const navPromise = page
+    await page
       .goto(safeTargetUrl, {
         waitUntil: 'domcontentloaded',
         timeout: NAV_TIMEOUT_MS
       })
-      .catch(() => null);
+      .catch(() => {});
 
-    // This is the speed boost:
-    // it returns immediately when any request/console/response reveals proxy-video.
-    first = await Promise.race([
-      collector.promise,
-      navPromise.then(() => null),
-      page.waitForTimeout(FIRST_PASS_WAIT_MS).then(() => null)
-    ]);
-
-    first = first || collector.check();
+    first = await waitForFirst(
+      page,
+      found,
+      targetUrl,
+      FIRST_PASS_WAIT_MS,
+      responseTasks
+    );
 
     if (first) {
       return {
@@ -510,32 +498,19 @@ async function resolveMovie(movieId) {
         movieId,
         sourceUrl: targetUrl,
         result: first,
-        mode: 'instant-network'
+        mode: 'browser-first-pass'
       };
     }
 
-    await dumpFrameContent(page, targetUrl, found, collector).catch(() => {});
+    await clickPossiblePlayers(page, found, targetUrl);
 
-    first = collector.check();
-
-    if (first) {
-      return {
-        ok: true,
-        movieId,
-        sourceUrl: targetUrl,
-        result: first,
-        mode: 'frame-dump'
-      };
-    }
-
-    await clickPossiblePlayers(page, found, targetUrl, collector);
-
-    first = await Promise.race([
-      collector.promise,
-      page.waitForTimeout(AFTER_CLICK_WAIT_MS).then(() => null)
-    ]);
-
-    first = first || collector.check();
+    first = await waitForFirst(
+      page,
+      found,
+      targetUrl,
+      AFTER_CLICK_WAIT_MS,
+      responseTasks
+    );
 
     if (first) {
       return {
@@ -543,16 +518,16 @@ async function resolveMovie(movieId) {
         movieId,
         sourceUrl: targetUrl,
         result: first,
-        mode: 'after-click'
+        mode: 'browser-after-click'
       };
     }
 
     await Promise.race([
       Promise.allSettled([...responseTasks]),
-      page.waitForTimeout(300).catch(() => {})
+      page.waitForTimeout(700).catch(() => {})
     ]).catch(() => {});
 
-    first = collector.check();
+    first = firstProxyVideoOnly(found);
 
     return {
       ok: Boolean(first),
