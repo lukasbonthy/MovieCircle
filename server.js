@@ -1,10 +1,13 @@
 const express = require('express');
 const { chromium } = require('playwright');
 const {
+  isMediaUrl,
   isApiProxy,
-  extractApiProxyUrls,
-  extractAssetUrls,
-  findFirstM3u8
+  isCrawlCandidate,
+  extractSourcesFromText,
+  extractUrlsFromText,
+  dedupeSources,
+  mediaType
 } = require('./src/extractor');
 
 const app = express();
@@ -12,8 +15,12 @@ const PORT = process.env.PORT || 3000;
 
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 5000);
-const ASSET_TIMEOUT_MS = Number(process.env.ASSET_TIMEOUT_MS || 3000);
 const BROWSER_WAIT_MS = Number(process.env.BROWSER_WAIT_MS || 9000);
+const MAX_DEPTH = Number(process.env.MAX_DEPTH || 3);
+const MAX_URLS = Number(process.env.MAX_URLS || 120);
+const MAX_SOURCES = Number(process.env.MAX_SOURCES || 100);
+const CRAWL_CONCURRENCY = Number(process.env.CRAWL_CONCURRENCY || 8);
+const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES || 3 * 1024 * 1024);
 
 const cache = new Map();
 const pending = new Map();
@@ -45,29 +52,99 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function createSignal() {
-  let done = false;
-  let resolveDone;
+function isSafeUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
 
-  const promise = new Promise((resolve) => {
-    resolveDone = resolve;
-  });
+    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    if (host === 'localhost' || host === '0.0.0.0' || host === '::1') return false;
+    if (/^127\./.test(host)) return false;
+    if (/^10\./.test(host)) return false;
+    if (/^192\.168\./.test(host)) return false;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
 
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function createDebug(enabled) {
   return {
-    promise,
+    enabled,
+    crawled: [],
+    foundUrls: [],
+    network: [],
 
-    resolve(value) {
-      if (!done && value) {
-        done = true;
-        resolveDone(value);
-      }
+    addCrawled(url, depth) {
+      if (!enabled) return;
+      if (this.crawled.length < 200) this.crawled.push({ depth, url });
+    },
+
+    addFound(url, source) {
+      if (!enabled) return;
+      if (this.foundUrls.length < 300) this.foundUrls.push({ source, url });
+    },
+
+    addNetwork(url, type) {
+      if (!enabled) return;
+      if (this.network.length < 300) this.network.push({ type, url });
+    },
+
+    data() {
+      return {
+        crawled: this.crawled,
+        foundUrls: this.foundUrls,
+        network: this.network
+      };
     }
   };
 }
 
-async function fetchText(url, referer, timeoutMs = FETCH_TIMEOUT_MS) {
+function addSources(bucket, sourceList, debug, foundIn = '') {
+  for (const source of sourceList || []) {
+    if (!source || !source.url) continue;
+    if (!isSafeUrl(source.url)) continue;
+
+    bucket.push({
+      ...source,
+      foundIn: source.foundIn || foundIn || 'unknown'
+    });
+
+    debug.addFound(source.url, source.foundIn || foundIn);
+  }
+
+  const clean = dedupeSources(bucket);
+  bucket.length = 0;
+  bucket.push(...clean.slice(0, MAX_SOURCES));
+
+  return bucket;
+}
+
+function makeDirectSource(url, foundIn = 'url') {
+  if (!isMediaUrl(url)) return null;
+
+  return {
+    name: null,
+    url,
+    type: mediaType(url),
+    quality: null,
+    headers: {},
+    foundIn
+  };
+}
+
+async function fetchText(url, referer = 'https://embed.filmu.in/') {
+  if (!isSafeUrl(url)) return '';
+
+  const direct = makeDirectSource(url);
+  if (direct && direct.type !== 'm3u8') {
+    return '';
+  }
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
     const response = await fetch(url, {
@@ -77,10 +154,25 @@ async function fetchText(url, referer, timeoutMs = FETCH_TIMEOUT_MS) {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
         Accept: 'application/json,text/plain,text/html,application/javascript,*/*',
-        Referer: referer || 'https://embed.filmu.in/',
-        Origin: 'https://embed.filmu.in'
+        Referer: referer,
+        Origin: new URL(referer).origin
       }
     });
+
+    const contentLength = Number(response.headers.get('content-length') || 0);
+    const contentType = response.headers.get('content-type') || '';
+
+    if (contentLength && contentLength > MAX_RESPONSE_BYTES) {
+      return '';
+    }
+
+    if (
+      contentType.includes('video') ||
+      contentType.includes('image') ||
+      contentType.includes('font')
+    ) {
+      return '';
+    }
 
     return await response.text().catch(() => '');
   } catch {
@@ -88,20 +180,6 @@ async function fetchText(url, referer, timeoutMs = FETCH_TIMEOUT_MS) {
   } finally {
     clearTimeout(timeout);
   }
-}
-
-async function fetchApiProxy(apiUrl, sourceUrl, debug) {
-  if (!apiUrl || !isApiProxy(apiUrl)) return null;
-
-  if (!debug.apiUrls.includes(apiUrl)) {
-    debug.apiUrls.push(apiUrl);
-  }
-
-  const text = await fetchText(apiUrl, sourceUrl, FETCH_TIMEOUT_MS);
-
-  if (!text) return null;
-
-  return findFirstM3u8(text, apiUrl);
 }
 
 async function mapLimit(items, limit, mapper) {
@@ -117,52 +195,63 @@ async function mapLimit(items, limit, mapper) {
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
-async function checkTextForApi(text, baseUrl, sourceUrl, debug) {
-  const apiUrls = extractApiProxyUrls(text, baseUrl);
+async function staticDigger(startUrl, debug) {
+  const sources = [];
+  const seen = new Set();
+  let currentLevel = [startUrl];
 
-  for (const apiUrl of apiUrls) {
-    const stream = await fetchApiProxy(apiUrl, sourceUrl, debug);
-    if (stream) return stream;
+  for (let depth = 0; depth <= MAX_DEPTH; depth++) {
+    const nextLevel = [];
+
+    const level = currentLevel
+      .filter(Boolean)
+      .filter((url) => isSafeUrl(url))
+      .filter((url) => {
+        if (seen.has(url)) return false;
+        seen.add(url);
+        return true;
+      })
+      .slice(0, MAX_URLS);
+
+    await mapLimit(level, CRAWL_CONCURRENCY, async (url) => {
+      if (seen.size > MAX_URLS) return;
+
+      debug.addCrawled(url, depth);
+
+      const direct = makeDirectSource(url, `static-url-depth-${depth}`);
+      if (direct) {
+        addSources(sources, [direct], debug, direct.foundIn);
+
+        if (direct.type !== 'm3u8') return;
+      }
+
+      const text = await fetchText(url, startUrl);
+      if (!text) return;
+
+      addSources(
+        sources,
+        extractSourcesFromText(text, url, `static-body-depth-${depth}`),
+        debug,
+        `static-body-depth-${depth}`
+      );
+
+      const foundUrls = extractUrlsFromText(text, url);
+
+      for (const foundUrl of foundUrls) {
+        if (!isSafeUrl(foundUrl)) continue;
+        if (!isCrawlCandidate(foundUrl)) continue;
+        if (seen.has(foundUrl)) continue;
+
+        nextLevel.push(foundUrl);
+      }
+    });
+
+    currentLevel = [...new Set(nextLevel)].slice(0, MAX_URLS);
+
+    if (!currentLevel.length) break;
   }
 
-  return null;
-}
-
-async function staticScan(sourceUrl, debug) {
-  debug.steps.push('static-html');
-
-  const html = await fetchText(sourceUrl, sourceUrl);
-
-  let stream = await checkTextForApi(html, sourceUrl, sourceUrl, debug);
-  if (stream) return stream;
-
-  const directM3u8 = findFirstM3u8(html, sourceUrl);
-  if (directM3u8) return directM3u8;
-
-  debug.steps.push('static-assets');
-
-  const assets = extractAssetUrls(html, sourceUrl);
-  debug.assets = assets.slice(0, 60);
-
-  await mapLimit(assets, 8, async (assetUrl) => {
-    if (stream) return;
-
-    if (isApiProxy(assetUrl)) {
-      stream = await fetchApiProxy(assetUrl, sourceUrl, debug);
-      return;
-    }
-
-    const assetText = await fetchText(assetUrl, sourceUrl, ASSET_TIMEOUT_MS);
-
-    stream = await checkTextForApi(assetText, assetUrl, sourceUrl, debug);
-
-    if (stream) return;
-
-    const assetM3u8 = findFirstM3u8(assetText, assetUrl);
-    if (assetM3u8) stream = assetM3u8;
-  });
-
-  return stream || null;
+  return dedupeSources(sources);
 }
 
 async function getBrowser() {
@@ -224,35 +313,35 @@ async function getContext() {
   return contextPromise;
 }
 
-async function browserScan(sourceUrl, debug) {
-  debug.steps.push('browser');
+async function browserDigger(startUrl, debug) {
+  const sources = [];
+  const discovered = new Set();
 
   const context = await getContext();
   const page = await context.newPage();
-  const signal = createSignal();
 
-  const seenApi = new Set();
+  function addUrlForLater(url, source) {
+    if (!url || !isSafeUrl(url)) return;
+    if (!isCrawlCandidate(url)) return;
+    if (discovered.has(url)) return;
 
-  async function queueApi(apiUrl) {
-    if (!apiUrl || !isApiProxy(apiUrl)) return;
-    if (seenApi.has(apiUrl)) return;
-
-    seenApi.add(apiUrl);
-
-    fetchApiProxy(apiUrl, sourceUrl, debug)
-      .then((stream) => signal.resolve(stream))
-      .catch(() => {});
+    discovered.add(url);
+    debug.addFound(url, source);
   }
 
-  async function checkText(text, baseUrl) {
-    const apiUrls = extractApiProxyUrls(text, baseUrl);
+  async function processText(text, baseUrl, foundIn) {
+    addSources(
+      sources,
+      extractSourcesFromText(text, baseUrl, foundIn),
+      debug,
+      foundIn
+    );
 
-    for (const apiUrl of apiUrls) {
-      await queueApi(apiUrl);
+    const urls = extractUrlsFromText(text, baseUrl);
+
+    for (const url of urls) {
+      addUrlForLater(url, foundIn);
     }
-
-    const direct = findFirstM3u8(text, baseUrl);
-    if (direct) signal.resolve(direct);
   }
 
   try {
@@ -264,8 +353,17 @@ async function browserScan(sourceUrl, debug) {
       const url = request.url();
       const type = request.resourceType();
 
-      if (isApiProxy(url)) {
-        await queueApi(url);
+      debug.addNetwork(url, `route:${type}`);
+
+      if (isMediaUrl(url)) {
+        const direct = makeDirectSource(url, `browser-route-${type}`);
+        if (direct) addSources(sources, [direct], debug, direct.foundIn);
+
+        return route.abort().catch(() => {});
+      }
+
+      if (isCrawlCandidate(url)) {
+        addUrlForLater(url, `browser-route-${type}`);
       }
 
       if (type === 'image' || type === 'font' || type === 'stylesheet') {
@@ -277,15 +375,17 @@ async function browserScan(sourceUrl, debug) {
 
     page.on('request', (request) => {
       const url = request.url();
+      debug.addNetwork(url, `request:${request.resourceType()}`);
 
-      if (isApiProxy(url)) {
-        queueApi(url);
+      if (isMediaUrl(url)) {
+        const direct = makeDirectSource(url, `browser-request-${request.resourceType()}`);
+        if (direct) addSources(sources, [direct], debug, direct.foundIn);
       }
 
       const postData = request.postData();
 
       if (postData) {
-        checkText(postData, sourceUrl).catch(() => {});
+        processText(postData, startUrl, 'browser-post-data').catch(() => {});
       }
     });
 
@@ -296,39 +396,35 @@ async function browserScan(sourceUrl, debug) {
         const contentType = headers['content-type'] || '';
         const length = Number(headers['content-length'] || 0);
 
-        if (isApiProxy(url)) {
-          const text = await response.text().catch(() => '');
-          const stream = findFirstM3u8(text, url);
+        debug.addNetwork(url, `response:${contentType}`);
 
-          if (!debug.apiUrls.includes(url)) {
-            debug.apiUrls.push(url);
-          }
-
-          signal.resolve(stream);
+        if (isMediaUrl(url)) {
+          const direct = makeDirectSource(url, 'browser-response-media');
+          if (direct) addSources(sources, [direct], debug, direct.foundIn);
           return;
         }
 
-        if (length && length > 2 * 1024 * 1024) return;
+        if (length && length > MAX_RESPONSE_BYTES) return;
 
         if (
+          isCrawlCandidate(url) ||
           contentType.includes('json') ||
           contentType.includes('javascript') ||
           contentType.includes('text') ||
-          url.includes('.js') ||
-          url.includes('.json')
+          contentType.includes('mpegurl')
         ) {
           const text = await response.text().catch(() => '');
-          await checkText(text, url);
+          await processText(text, url, 'browser-response-body');
         }
       })().catch(() => {});
     });
 
     page.on('console', (msg) => {
-      checkText(msg.text(), sourceUrl).catch(() => {});
+      processText(msg.text(), startUrl, 'browser-console').catch(() => {});
     });
 
     await page
-      .goto(sourceUrl, {
+      .goto(startUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 16000
       })
@@ -336,83 +432,83 @@ async function browserScan(sourceUrl, debug) {
 
     for (const frame of page.frames()) {
       const html = await frame.content().catch(() => '');
-      await checkText(html, frame.url() || sourceUrl);
-
-      const winner = await Promise.race([
-        signal.promise,
-        sleep(50).then(() => null)
-      ]);
-
-      if (winner) return winner;
+      await processText(html, frame.url() || startUrl, 'browser-frame-html');
     }
 
     await page.mouse.click(640, 360).catch(() => {});
     await page.keyboard.press('Space').catch(() => {});
 
-    const winner = await Promise.race([
-      signal.promise,
-      sleep(BROWSER_WAIT_MS).then(() => null)
-    ]);
-
-    if (winner) return winner;
+    await sleep(BROWSER_WAIT_MS);
 
     for (const frame of page.frames()) {
       const html = await frame.content().catch(() => '');
-      await checkText(html, frame.url() || sourceUrl);
-
-      const finalWinner = await Promise.race([
-        signal.promise,
-        sleep(50).then(() => null)
-      ]);
-
-      if (finalWinner) return finalWinner;
+      await processText(html, frame.url() || startUrl, 'browser-final-frame-html');
     }
-
-    return null;
   } finally {
     await page.close().catch(() => {});
   }
+
+  const discoveredUrls = [...discovered].slice(0, 50);
+
+  await mapLimit(discoveredUrls, 6, async (url) => {
+    const direct = makeDirectSource(url, 'browser-discovered-url');
+
+    if (direct) {
+      addSources(sources, [direct], debug, direct.foundIn);
+      if (direct.type !== 'm3u8') return;
+    }
+
+    const text = await fetchText(url, startUrl);
+    if (!text) return;
+
+    addSources(
+      sources,
+      extractSourcesFromText(text, url, 'browser-discovered-body'),
+      debug,
+      'browser-discovered-body'
+    );
+  });
+
+  return dedupeSources(sources);
 }
 
-async function resolveMovie(movieId, debugMode = false) {
+function cacheKey(movieId, deep) {
+  return `${movieId}:deep=${deep ? '1' : '0'}`;
+}
+
+async function resolveMovie(movieId, options = {}) {
+  const deep = options.deep !== false;
   const sourceUrl = `https://embed.filmu.in/movie/${encodeURIComponent(movieId)}`;
+  const debug = createDebug(Boolean(options.debug));
 
-  const debug = {
-    steps: [],
-    apiUrls: [],
-    assets: []
-  };
+  let sources = await staticDigger(sourceUrl, debug);
 
-  let stream = await staticScan(sourceUrl, debug);
-
-  if (!stream) {
-    stream = await browserScan(sourceUrl, debug);
+  if (deep) {
+    const browserSources = await browserDigger(sourceUrl, debug);
+    sources = dedupeSources([...sources, ...browserSources]);
   }
 
-  if (!stream) {
-    return {
-      ok: false,
-      movieId,
-      sourceUrl,
-      debug: debugMode ? debug : undefined
-    };
-  }
+  const m3u8Sources = sources.filter((source) => source.type === 'm3u8');
+  const mp4Sources = sources.filter((source) => source.type === 'mp4');
 
   return {
-    ok: true,
+    ok: sources.length > 0,
     movieId,
     sourceUrl,
-    apiProxyUrl: stream.apiProxyUrl || null,
-    m3u8: stream.url,
-    headers: stream.headers || {},
-    stream,
-    debug: debugMode ? debug : undefined
+    count: sources.length,
+    best: sources[0] || null,
+    m3u8: m3u8Sources[0]?.url || null,
+    mp4: mp4Sources[0]?.url || null,
+    sources,
+    debug: options.debug ? debug.data() : undefined
   };
 }
 
-async function resolveMovieCached(movieId, debugMode, refresh) {
-  if (!debugMode && !refresh) {
-    const cached = cache.get(movieId);
+async function resolveMovieCached(movieId, options = {}) {
+  const key = cacheKey(movieId, options.deep !== false);
+
+  if (!options.debug && !options.refresh) {
+    const cached = cache.get(key);
 
     if (cached && Date.now() - cached.savedAt < CACHE_TTL_MS) {
       return {
@@ -422,14 +518,14 @@ async function resolveMovieCached(movieId, debugMode, refresh) {
     }
   }
 
-  if (!debugMode && pending.has(movieId)) {
-    return pending.get(movieId);
+  if (!options.debug && pending.has(key)) {
+    return pending.get(key);
   }
 
-  const job = resolveMovie(movieId, debugMode)
+  const job = resolveMovie(movieId, options)
     .then((result) => {
-      if (result.ok && !debugMode) {
-        cache.set(movieId, {
+      if (result.ok && !options.debug) {
+        cache.set(key, {
           savedAt: Date.now(),
           data: result
         });
@@ -440,15 +536,17 @@ async function resolveMovieCached(movieId, debugMode, refresh) {
         cached: false
       };
     })
-    .finally(() => pending.delete(movieId));
+    .finally(() => pending.delete(key));
 
-  if (!debugMode) pending.set(movieId, job);
+  if (!options.debug) pending.set(key, job);
 
   return job;
 }
 
 app.get('/', (_req, res) => {
-  res.type('text/plain').send('Use /movie/{id}. Example: /movie/1726?refresh=1&debug=1');
+  res.type('text/plain').send(
+    'Use /movie/{id}\nExample: /movie/1726?refresh=1&debug=1\nFast static only: /movie/1726?fast=1'
+  );
 });
 
 app.get('/healthz', (_req, res) => {
@@ -465,17 +563,18 @@ app.get('/movie/:id', async (req, res) => {
   const started = Date.now();
 
   try {
-    const result = await resolveMovieCached(
-      movieId,
-      req.query.debug === '1',
-      req.query.refresh === '1'
-    );
+    const result = await resolveMovieCached(movieId, {
+      refresh: req.query.refresh === '1',
+      debug: req.query.debug === '1',
+      deep: req.query.fast !== '1'
+    });
 
     if (!result.ok) {
-      return jsonError(res, 404, 'No m3u8 source found.', {
+      return jsonError(res, 404, 'No media sources found.', {
         movieId,
         ms: Date.now() - started,
         sourceUrl: result.sourceUrl,
+        count: 0,
         debug: result.debug
       });
     }
@@ -486,10 +585,11 @@ app.get('/movie/:id', async (req, res) => {
       cached: Boolean(result.cached),
       ms: Date.now() - started,
       sourceUrl: result.sourceUrl,
-      apiProxyUrl: result.apiProxyUrl,
+      count: result.count,
+      best: result.best,
       m3u8: result.m3u8,
-      headers: result.headers,
-      stream: result.stream,
+      mp4: result.mp4,
+      sources: result.sources,
       debug: result.debug
     });
   } catch (error) {
@@ -504,7 +604,7 @@ app.use((req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`MovieResolver running on ${PORT}`);
+  console.log(`MovieResolver digger running on ${PORT}`);
 
   getContext()
     .then(() => console.log('Chromium warmed up'))
