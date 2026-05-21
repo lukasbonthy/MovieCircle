@@ -1,8 +1,6 @@
 function cleanText(text = '') {
   return String(text)
     .replace(/&amp;/g, '&')
-    .replace(/&#x2F;/gi, '/')
-    .replace(/&#47;/g, '/')
     .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => {
       try {
         return String.fromCharCode(parseInt(hex, 16));
@@ -16,7 +14,7 @@ function cleanText(text = '') {
 function safeDecode(value = '') {
   let output = String(value);
 
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     try {
       const decoded = decodeURIComponent(output);
       if (decoded === output) break;
@@ -41,16 +39,11 @@ function normalizeUrl(raw = '', baseUrl = '') {
 
   let value = trimUrl(cleanText(raw));
 
-  if (!value) return null;
   if (value.startsWith('ttps://')) value = `h${value}`;
   if (value.startsWith('//')) value = `https:${value}`;
 
   if (/^https%3A%2F%2F/i.test(value)) {
     value = safeDecode(value);
-  }
-
-  if (/^[a-z0-9.-]+\.[a-z]{2,}\//i.test(value)) {
-    value = `https://${value}`;
   }
 
   try {
@@ -60,291 +53,170 @@ function normalizeUrl(raw = '', baseUrl = '') {
   }
 }
 
-function isMediaUrl(url = '') {
-  const decoded = safeDecode(cleanText(url)).toLowerCase();
-
-  return (
-    decoded.includes('.m3u8') ||
-    decoded.includes('.mp4') ||
-    decoded.includes('.webm') ||
-    decoded.includes('.m4v') ||
-    decoded.includes('.mov')
-  );
-}
-
-function mediaType(url = '', fallback = '') {
-  const decoded = safeDecode(cleanText(url)).toLowerCase();
-
-  if (decoded.includes('.m3u8')) return 'm3u8';
-  if (decoded.includes('.mp4')) return 'mp4';
-  if (decoded.includes('.webm')) return 'webm';
-  if (decoded.includes('.m4v')) return 'm4v';
-  if (decoded.includes('.mov')) return 'mov';
-
-  return fallback || 'media';
-}
-
 function isApiProxy(url = '') {
   try {
-    const parsed = new URL(url);
+    const parsed = new URL(normalizeUrl(url) || url);
     return parsed.pathname === '/api/proxy' && parsed.searchParams.has('path');
   } catch {
     return false;
   }
 }
 
-function isCrawlCandidate(url = '') {
-  const decoded = safeDecode(cleanText(url)).toLowerCase();
-
-  return (
-    isMediaUrl(decoded) ||
-    decoded.includes('/api/proxy') ||
-    decoded.includes('/api/') ||
-    decoded.includes('/scrape/') ||
-    decoded.includes('proxy') ||
-    decoded.includes('embed') ||
-    decoded.includes('player') ||
-    decoded.includes('movie') ||
-    decoded.includes('stream') ||
-    decoded.includes('source') ||
-    decoded.includes('.js') ||
-    decoded.includes('.json') ||
-    decoded.includes('.m3u8')
-  );
+function isM3u8Url(url = '') {
+  return safeDecode(cleanText(url)).toLowerCase().includes('.m3u8');
 }
 
-function normalizeHeaders(value) {
-  if (!value || typeof value !== 'object') return {};
-  const output = {};
-  for (const [key, val] of Object.entries(value)) {
-    if (typeof val === 'string') output[key] = val;
+function extractApiProxyUrls(text = '', baseUrl = '') {
+  const cleaned = cleanText(text);
+  const out = [];
+  const seen = new Set();
+
+  const patterns = [
+    /https?:\/\/[^\s'"<>`]+\/api\/proxy\?path=[^\s'"<>`]+/gi,
+    /\/\/[^\s'"<>`]+\/api\/proxy\?path=[^\s'"<>`]+/gi,
+    /\/api\/proxy\?path=[^\s'"<>`]+/gi,
+    /api\/proxy\?path=[^\s'"<>`]+/gi,
+    /['"]([^'"]*\/api\/proxy\?path=[^'"]+)['"]/gi,
+    /['"]([^'"]*api\/proxy\?path=[^'"]+)['"]/gi
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of cleaned.matchAll(pattern)) {
+      const raw = match[1] || match[0];
+      const absolute = normalizeUrl(raw, baseUrl);
+
+      if (!absolute) continue;
+      if (!isApiProxy(absolute)) continue;
+      if (seen.has(absolute)) continue;
+
+      seen.add(absolute);
+      out.push(absolute);
+    }
   }
-  return output;
+
+  return out;
 }
 
-function normalizeSource(rawSource, baseUrl = '', foundIn = 'unknown') {
-  if (!rawSource) return null;
+function extractAssetUrls(text = '', baseUrl = '', max = 80) {
+  const cleaned = cleanText(text);
+  const out = [];
+  const seen = new Set();
 
-  let rawUrl = null;
-  let name = null;
-  let quality = null;
-  let type = null;
-  let headers = {};
+  const patterns = [
+    /<script[^>]+src=['"]([^'"]+)['"]/gi,
+    /<iframe[^>]+src=['"]([^'"]+)['"]/gi,
+    /<(?:link|a)[^>]+href=['"]([^'"]+)['"]/gi,
+    /['"]([^'"]+\.(?:js|json)(?:\?[^'"]*)?)['"]/gi,
+    /['"]([^'"]*(?:api|proxy|scrape|embed|player|movie)[^'"]*)['"]/gi,
+    /(?:fetch|open)\(\s*['"]([^'"]+)['"]/gi
+  ];
 
-  if (typeof rawSource === 'string') {
-    rawUrl = rawSource;
-  } else if (typeof rawSource === 'object') {
-    rawUrl =
-      rawSource.url ||
-      rawSource.file ||
-      rawSource.src ||
-      rawSource.link ||
-      rawSource.workerProxyUrl ||
-      null;
+  for (const pattern of patterns) {
+    for (const match of cleaned.matchAll(pattern)) {
+      const absolute = normalizeUrl(match[1], baseUrl);
+      if (!absolute) continue;
 
-    name = rawSource.name || rawSource.label || rawSource.server || null;
-    quality = rawSource.quality || rawSource.resolution || null;
-    type = rawSource.type || null;
-    headers = normalizeHeaders(rawSource.headers || rawSource.requestHeaders || {});
+      const lower = absolute.toLowerCase();
+      const useful =
+        lower.includes('/api/proxy') ||
+        lower.includes('.js') ||
+        lower.includes('.json') ||
+        lower.includes('api') ||
+        lower.includes('proxy') ||
+        lower.includes('scrape') ||
+        lower.includes('embed') ||
+        lower.includes('player') ||
+        lower.includes('movie');
+
+      if (!useful) continue;
+      if (seen.has(absolute)) continue;
+
+      seen.add(absolute);
+      out.push(absolute);
+
+      if (out.length >= max) return out;
+    }
   }
 
-  const url = normalizeUrl(rawUrl, baseUrl);
-  if (!url) return null;
+  return out;
+}
 
-  const decoded = safeDecode(url);
-  if (!isMediaUrl(url) && !isMediaUrl(decoded) && type !== 'm3u8') {
+function findFirstM3u8Object(value, apiProxyUrl = '', foundIn = 'unknown') {
+  if (!value) return null;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFirstM3u8Object(item, apiProxyUrl, foundIn);
+      if (found) return found;
+    }
     return null;
   }
 
-  return {
-    name,
-    url,
-    type: mediaType(url, type),
-    quality,
-    headers,
-    foundIn
-  };
-}
-
-function findSourcesDeep(value, baseUrl, foundIn, output = []) {
-  if (!value) return output;
-
-  if (Array.isArray(value)) {
-    for (const item of value) findSourcesDeep(item, baseUrl, foundIn, output);
-    return output;
-  }
-
   if (typeof value === 'object') {
-    const direct = normalizeSource(value, baseUrl, foundIn);
-    if (direct) output.push(direct);
+    const possibleUrl = value.url || value.file || value.src || value.link;
 
+    if (possibleUrl && isM3u8Url(possibleUrl)) {
+      return {
+        name: value.name || value.label || null,
+        url: String(possibleUrl),
+        quality: value.quality || value.resolution || null,
+        type: 'm3u8',
+        headers: value.headers || value.requestHeaders || {},
+        apiProxyUrl,
+        foundIn
+      };
+    }
+
+    // Important: preserve original order. sources first because the wanted JSON uses sources[].
     if (Array.isArray(value.sources)) {
       for (const source of value.sources) {
-        const parsed = normalizeSource(source, baseUrl, foundIn);
-        if (parsed) output.push(parsed);
-        findSourcesDeep(source, baseUrl, foundIn, output);
+        const found = findFirstM3u8Object(source, apiProxyUrl, foundIn);
+        if (found) return found;
       }
     }
 
     for (const nested of Object.values(value)) {
-      findSourcesDeep(nested, baseUrl, foundIn, output);
+      const found = findFirstM3u8Object(nested, apiProxyUrl, foundIn);
+      if (found) return found;
     }
   }
 
-  return output;
+  return null;
 }
 
-function extractPlaylistSources(text = '', baseUrl = '', foundIn = 'playlist') {
+function findFirstM3u8(text = '', apiProxyUrl = '', foundIn = 'unknown') {
   const cleaned = cleanText(text);
-  if (!cleaned.includes('#EXTM3U')) return [];
-
-  const sources = [];
-  const lines = cleaned.split(/\r?\n/);
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-
-    const url = normalizeUrl(trimmed, baseUrl);
-    if (!url || !isMediaUrl(url)) continue;
-
-    sources.push({
-      name: null,
-      url,
-      type: mediaType(url),
-      quality: null,
-      headers: {},
-      foundIn
-    });
-  }
-
-  return sources;
-}
-
-function extractSourcesFromText(text = '', baseUrl = '', foundIn = 'text') {
-  const cleaned = cleanText(text);
-  const sources = [];
 
   try {
-    const json = JSON.parse(cleaned);
-    sources.push(...findSourcesDeep(json, baseUrl, foundIn));
+    const parsed = JSON.parse(cleaned);
+    const fromJson = findFirstM3u8Object(parsed, apiProxyUrl, foundIn);
+    if (fromJson) return fromJson;
   } catch {}
 
-  sources.push(...extractPlaylistSources(cleaned, baseUrl, foundIn));
+  const match = cleaned.match(/https?:\/\/[^\s'"<>`]+?\.m3u8[^\s'"<>`]*/i);
 
-  const patterns = [
-    /https?:\/\/[^\s"'<>`]+?(?:\.m3u8|\.mp4|\.webm|\.m4v|\.mov)(?:[^\s"'<>`]*)?/gi,
-    /https%3A%2F%2F[^\s"'<>`]+?(?:m3u8|mp4|webm|m4v|mov)[^\s"'<>`]*/gi,
-    /["']([^"']+?(?:\.m3u8|\.mp4|\.webm|\.m4v|\.mov)(?:\?[^"']*)?)["']/gi
-  ];
-
-  for (const pattern of patterns) {
-    for (const match of cleaned.matchAll(pattern)) {
-      const raw = match[1] || match[0];
-      const source = normalizeSource(raw, baseUrl, foundIn);
-      if (source) sources.push(source);
-    }
+  if (match) {
+    return {
+      name: null,
+      url: trimUrl(match[0]),
+      quality: null,
+      type: 'm3u8',
+      headers: {},
+      apiProxyUrl,
+      foundIn
+    };
   }
 
-  return dedupeSources(sources);
-}
-
-function extractUrlsFromText(text = '', baseUrl = '') {
-  const cleaned = cleanText(text);
-  const urls = [];
-  const seen = new Set();
-
-  const patterns = [
-    /https?:\/\/[^\s"'<>`]+/gi,
-    /ttps:\/\/[^\s"'<>`]+/gi,
-    /\/\/[^\s"'<>`]+/gi,
-    /https%3A%2F%2F[^\s"'<>`]+/gi,
-    /\/api\/proxy\?path=[^\s"'<>`]+/gi,
-    /\/[^\s"'<>`]*?(?:api|proxy|scrape|embed|player|movie|stream|source)[^\s"'<>`]*/gi,
-    /<script[^>]+src=["']([^"']+)["']/gi,
-    /<iframe[^>]+src=["']([^"']+)["']/gi,
-    /<(?:source|video|a|link)[^>]+(?:src|href)=["']([^"']+)["']/gi,
-    /(?:fetch|open)\(\s*["']([^"']+)["']/gi,
-    /["']([^"']+\.(?:js|json|m3u8|mp4)(?:\?[^"']*)?)["']/gi,
-    /["']([^"']*(?:api|proxy|scrape|embed|player|movie|stream|source)[^"']*)["']/gi
-  ];
-
-  for (const pattern of patterns) {
-    for (const match of cleaned.matchAll(pattern)) {
-      const raw = match[1] || match[0];
-      const url = normalizeUrl(raw, baseUrl);
-
-      if (!url) continue;
-      if (!isCrawlCandidate(url)) continue;
-      if (seen.has(url)) continue;
-
-      seen.add(url);
-      urls.push(url);
-    }
-  }
-
-  return urls.sort((a, b) => crawlPriority(b) - crawlPriority(a));
-}
-
-function crawlPriority(url = '') {
-  const lower = safeDecode(url).toLowerCase();
-
-  if (lower.includes('.m3u8')) return 100;
-  if (lower.includes('/api/proxy')) return 95;
-  if (lower.includes('.mp4')) return 90;
-  if (lower.includes('/scrape/')) return 80;
-  if (lower.includes('.json')) return 70;
-  if (lower.includes('.js')) return 60;
-  if (lower.includes('player')) return 55;
-  if (lower.includes('embed')) return 50;
-
-  return 10;
-}
-
-function sourceScore(source) {
-  const type = String(source.type || '').toLowerCase();
-  const quality = String(source.quality || '');
-
-  let score = 0;
-
-  if (type === 'm3u8') score += 10000;
-  if (type === 'mp4') score += 7000;
-  if (source.url && source.url.includes('.m3u8')) score += 2000;
-  if (source.url && source.url.includes('.mp4')) score += 1000;
-
-  const qualityNumber = Number((quality.match(/\d+/) || [0])[0]);
-  score += qualityNumber;
-
-  return score;
-}
-
-function dedupeSources(sources = []) {
-  const seen = new Set();
-  const output = [];
-
-  for (const source of sources) {
-    if (!source || !source.url) continue;
-
-    const key = `${source.url}|${JSON.stringify(source.headers || {})}`;
-    if (seen.has(key)) continue;
-
-    seen.add(key);
-    output.push(source);
-  }
-
-  return output.sort((a, b) => sourceScore(b) - sourceScore(a));
+  return null;
 }
 
 module.exports = {
   cleanText,
   safeDecode,
   normalizeUrl,
-  isMediaUrl,
-  mediaType,
   isApiProxy,
-  isCrawlCandidate,
-  extractSourcesFromText,
-  extractUrlsFromText,
-  dedupeSources,
-  sourceScore
+  isM3u8Url,
+  extractApiProxyUrls,
+  extractAssetUrls,
+  findFirstM3u8
 };
