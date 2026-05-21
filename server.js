@@ -2,7 +2,6 @@ const express = require('express');
 const { chromium } = require('playwright');
 const {
   isMediaUrl,
-  isApiProxy,
   isCrawlCandidate,
   extractSourcesFromText,
   extractUrlsFromText,
@@ -14,13 +13,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
-const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 5000);
-const BROWSER_WAIT_MS = Number(process.env.BROWSER_WAIT_MS || 9000);
-const MAX_DEPTH = Number(process.env.MAX_DEPTH || 3);
-const MAX_URLS = Number(process.env.MAX_URLS || 120);
-const MAX_SOURCES = Number(process.env.MAX_SOURCES || 100);
-const CRAWL_CONCURRENCY = Number(process.env.CRAWL_CONCURRENCY || 8);
-const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES || 3 * 1024 * 1024);
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 2500);
+const BROWSER_WAIT_MS = Number(process.env.BROWSER_WAIT_MS || 3500);
+const MAX_DEPTH = Number(process.env.MAX_DEPTH || 2);
+const MAX_URLS = Number(process.env.MAX_URLS || 55);
+const MAX_SOURCES = Number(process.env.MAX_SOURCES || 50);
+const CRAWL_CONCURRENCY = Number(process.env.CRAWL_CONCURRENCY || 12);
+const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES || 1200 * 1024);
+const STOP_ON_FIRST_M3U8 = process.env.STOP_ON_FIRST_M3U8 !== '0';
+const ENABLE_BROWSER = process.env.ENABLE_BROWSER !== '0';
 
 const cache = new Map();
 const pending = new Map();
@@ -41,11 +42,7 @@ app.use((req, res, next) => {
 });
 
 function jsonError(res, status, error, extra = {}) {
-  return res.status(status).json({
-    ok: false,
-    error,
-    ...extra
-  });
+  return res.status(status).json({ ok: false, error, ...extra });
 }
 
 function sleep(ms) {
@@ -63,6 +60,7 @@ function isSafeUrl(url) {
     if (/^10\./.test(host)) return false;
     if (/^192\.168\./.test(host)) return false;
     if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
+    if (/^169\.254\./.test(host)) return false;
 
     return true;
   } catch {
@@ -79,17 +77,17 @@ function createDebug(enabled) {
 
     addCrawled(url, depth) {
       if (!enabled) return;
-      if (this.crawled.length < 200) this.crawled.push({ depth, url });
+      if (this.crawled.length < 150) this.crawled.push({ depth, url });
     },
 
     addFound(url, source) {
       if (!enabled) return;
-      if (this.foundUrls.length < 300) this.foundUrls.push({ source, url });
+      if (this.foundUrls.length < 220) this.foundUrls.push({ source, url });
     },
 
     addNetwork(url, type) {
       if (!enabled) return;
-      if (this.network.length < 300) this.network.push({ type, url });
+      if (this.network.length < 220) this.network.push({ type, url });
     },
 
     data() {
@@ -122,6 +120,10 @@ function addSources(bucket, sourceList, debug, foundIn = '') {
   return bucket;
 }
 
+function hasM3u8(sources) {
+  return sources.some((source) => source.type === 'm3u8');
+}
+
 function makeDirectSource(url, foundIn = 'url') {
   if (!isMediaUrl(url)) return null;
 
@@ -139,9 +141,7 @@ async function fetchText(url, referer = 'https://embed.filmu.in/') {
   if (!isSafeUrl(url)) return '';
 
   const direct = makeDirectSource(url);
-  if (direct && direct.type !== 'm3u8') {
-    return '';
-  }
+  if (direct && direct.type !== 'm3u8') return '';
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -162,17 +162,8 @@ async function fetchText(url, referer = 'https://embed.filmu.in/') {
     const contentLength = Number(response.headers.get('content-length') || 0);
     const contentType = response.headers.get('content-type') || '';
 
-    if (contentLength && contentLength > MAX_RESPONSE_BYTES) {
-      return '';
-    }
-
-    if (
-      contentType.includes('video') ||
-      contentType.includes('image') ||
-      contentType.includes('font')
-    ) {
-      return '';
-    }
+    if (contentLength && contentLength > MAX_RESPONSE_BYTES) return '';
+    if (contentType.includes('video') || contentType.includes('image') || contentType.includes('font')) return '';
 
     return await response.text().catch(() => '');
   } catch {
@@ -215,13 +206,13 @@ async function staticDigger(startUrl, debug) {
 
     await mapLimit(level, CRAWL_CONCURRENCY, async (url) => {
       if (seen.size > MAX_URLS) return;
+      if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) return;
 
       debug.addCrawled(url, depth);
 
       const direct = makeDirectSource(url, `static-url-depth-${depth}`);
       if (direct) {
         addSources(sources, [direct], debug, direct.foundIn);
-
         if (direct.type !== 'm3u8') return;
       }
 
@@ -235,19 +226,23 @@ async function staticDigger(startUrl, debug) {
         `static-body-depth-${depth}`
       );
 
+      if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) return;
+
       const foundUrls = extractUrlsFromText(text, url);
 
       for (const foundUrl of foundUrls) {
         if (!isSafeUrl(foundUrl)) continue;
         if (!isCrawlCandidate(foundUrl)) continue;
         if (seen.has(foundUrl)) continue;
+        if (nextLevel.length >= MAX_URLS) break;
 
         nextLevel.push(foundUrl);
       }
     });
 
-    currentLevel = [...new Set(nextLevel)].slice(0, MAX_URLS);
+    if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) break;
 
+    currentLevel = [...new Set(nextLevel)].slice(0, MAX_URLS);
     if (!currentLevel.length) break;
   }
 
@@ -314,6 +309,8 @@ async function getContext() {
 }
 
 async function browserDigger(startUrl, debug) {
+  if (!ENABLE_BROWSER) return [];
+
   const sources = [];
   const discovered = new Set();
 
@@ -330,23 +327,17 @@ async function browserDigger(startUrl, debug) {
   }
 
   async function processText(text, baseUrl, foundIn) {
-    addSources(
-      sources,
-      extractSourcesFromText(text, baseUrl, foundIn),
-      debug,
-      foundIn
-    );
+    addSources(sources, extractSourcesFromText(text, baseUrl, foundIn), debug, foundIn);
+
+    if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) return;
 
     const urls = extractUrlsFromText(text, baseUrl);
-
-    for (const url of urls) {
-      addUrlForLater(url, foundIn);
-    }
+    for (const url of urls) addUrlForLater(url, foundIn);
   }
 
   try {
-    page.setDefaultNavigationTimeout(16000);
-    page.setDefaultTimeout(6000);
+    page.setDefaultNavigationTimeout(12000);
+    page.setDefaultTimeout(4500);
 
     await page.route('**/*', async (route) => {
       const request = route.request();
@@ -358,13 +349,10 @@ async function browserDigger(startUrl, debug) {
       if (isMediaUrl(url)) {
         const direct = makeDirectSource(url, `browser-route-${type}`);
         if (direct) addSources(sources, [direct], debug, direct.foundIn);
-
         return route.abort().catch(() => {});
       }
 
-      if (isCrawlCandidate(url)) {
-        addUrlForLater(url, `browser-route-${type}`);
-      }
+      if (isCrawlCandidate(url)) addUrlForLater(url, `browser-route-${type}`);
 
       if (type === 'image' || type === 'font' || type === 'stylesheet') {
         return route.abort().catch(() => {});
@@ -383,14 +371,13 @@ async function browserDigger(startUrl, debug) {
       }
 
       const postData = request.postData();
-
-      if (postData) {
-        processText(postData, startUrl, 'browser-post-data').catch(() => {});
-      }
+      if (postData) processText(postData, startUrl, 'browser-post-data').catch(() => {});
     });
 
     page.on('response', (response) => {
       (async () => {
+        if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) return;
+
         const url = response.url();
         const headers = response.headers();
         const contentType = headers['content-type'] || '';
@@ -423,14 +410,10 @@ async function browserDigger(startUrl, debug) {
       processText(msg.text(), startUrl, 'browser-console').catch(() => {});
     });
 
-    await page
-      .goto(startUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 16000
-      })
-      .catch(() => null);
+    await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => null);
 
     for (const frame of page.frames()) {
+      if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) break;
       const html = await frame.content().catch(() => '');
       await processText(html, frame.url() || startUrl, 'browser-frame-html');
     }
@@ -438,9 +421,14 @@ async function browserDigger(startUrl, debug) {
     await page.mouse.click(640, 360).catch(() => {});
     await page.keyboard.press('Space').catch(() => {});
 
-    await sleep(BROWSER_WAIT_MS);
+    const waitStart = Date.now();
+    while (Date.now() - waitStart < BROWSER_WAIT_MS) {
+      if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) break;
+      await sleep(200);
+    }
 
     for (const frame of page.frames()) {
+      if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) break;
       const html = await frame.content().catch(() => '');
       await processText(html, frame.url() || startUrl, 'browser-final-frame-html');
     }
@@ -448,26 +436,29 @@ async function browserDigger(startUrl, debug) {
     await page.close().catch(() => {});
   }
 
-  const discoveredUrls = [...discovered].slice(0, 50);
+  if (!STOP_ON_FIRST_M3U8 || !hasM3u8(sources)) {
+    const discoveredUrls = [...discovered].slice(0, 30);
 
-  await mapLimit(discoveredUrls, 6, async (url) => {
-    const direct = makeDirectSource(url, 'browser-discovered-url');
+    await mapLimit(discoveredUrls, 8, async (url) => {
+      if (STOP_ON_FIRST_M3U8 && hasM3u8(sources)) return;
 
-    if (direct) {
-      addSources(sources, [direct], debug, direct.foundIn);
-      if (direct.type !== 'm3u8') return;
-    }
+      const direct = makeDirectSource(url, 'browser-discovered-url');
+      if (direct) {
+        addSources(sources, [direct], debug, direct.foundIn);
+        if (direct.type !== 'm3u8') return;
+      }
 
-    const text = await fetchText(url, startUrl);
-    if (!text) return;
+      const text = await fetchText(url, startUrl);
+      if (!text) return;
 
-    addSources(
-      sources,
-      extractSourcesFromText(text, url, 'browser-discovered-body'),
-      debug,
-      'browser-discovered-body'
-    );
-  });
+      addSources(
+        sources,
+        extractSourcesFromText(text, url, 'browser-discovered-body'),
+        debug,
+        'browser-discovered-body'
+      );
+    });
+  }
 
   return dedupeSources(sources);
 }
@@ -482,6 +473,24 @@ async function resolveMovie(movieId, options = {}) {
   const debug = createDebug(Boolean(options.debug));
 
   let sources = await staticDigger(sourceUrl, debug);
+
+  if (sources.length > 0 && (STOP_ON_FIRST_M3U8 ? hasM3u8(sources) : true)) {
+    const m3u8Sources = sources.filter((source) => source.type === 'm3u8');
+    const mp4Sources = sources.filter((source) => source.type === 'mp4');
+
+    return {
+      ok: true,
+      movieId,
+      sourceUrl,
+      count: sources.length,
+      best: sources[0] || null,
+      m3u8: m3u8Sources[0]?.url || null,
+      mp4: mp4Sources[0]?.url || null,
+      sources,
+      mode: 'static-fast',
+      debug: options.debug ? debug.data() : undefined
+    };
+  }
 
   if (deep) {
     const browserSources = await browserDigger(sourceUrl, debug);
@@ -500,6 +509,7 @@ async function resolveMovie(movieId, options = {}) {
     m3u8: m3u8Sources[0]?.url || null,
     mp4: mp4Sources[0]?.url || null,
     sources,
+    mode: deep ? 'browser-fallback' : 'static-only',
     debug: options.debug ? debug.data() : undefined
   };
 }
@@ -511,30 +521,19 @@ async function resolveMovieCached(movieId, options = {}) {
     const cached = cache.get(key);
 
     if (cached && Date.now() - cached.savedAt < CACHE_TTL_MS) {
-      return {
-        ...cached.data,
-        cached: true
-      };
+      return { ...cached.data, cached: true };
     }
   }
 
-  if (!options.debug && pending.has(key)) {
-    return pending.get(key);
-  }
+  if (!options.debug && pending.has(key)) return pending.get(key);
 
   const job = resolveMovie(movieId, options)
     .then((result) => {
       if (result.ok && !options.debug) {
-        cache.set(key, {
-          savedAt: Date.now(),
-          data: result
-        });
+        cache.set(key, { savedAt: Date.now(), data: result });
       }
 
-      return {
-        ...result,
-        cached: false
-      };
+      return { ...result, cached: false };
     })
     .finally(() => pending.delete(key));
 
@@ -545,7 +544,7 @@ async function resolveMovieCached(movieId, options = {}) {
 
 app.get('/', (_req, res) => {
   res.type('text/plain').send(
-    'Use /movie/{id}\nExample: /movie/1726?refresh=1&debug=1\nFast static only: /movie/1726?fast=1'
+    'Use /movie/{id}\nExample: /movie/1726?refresh=1\nDebug: /movie/1726?refresh=1&debug=1\nFast static only: /movie/1726?refresh=1&fast=1'
   );
 });
 
@@ -584,6 +583,7 @@ app.get('/movie/:id', async (req, res) => {
       movieId,
       cached: Boolean(result.cached),
       ms: Date.now() - started,
+      mode: result.mode,
       sourceUrl: result.sourceUrl,
       count: result.count,
       best: result.best,
@@ -604,11 +604,13 @@ app.use((req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`MovieResolver digger running on ${PORT}`);
+  console.log(`MovieResolver fast digger running on ${PORT}`);
 
-  getContext()
-    .then(() => console.log('Chromium warmed up'))
-    .catch((err) => console.error('Chromium warmup failed:', err.message));
+  if (ENABLE_BROWSER) {
+    getContext()
+      .then(() => console.log('Chromium warmed up'))
+      .catch((err) => console.error('Chromium warmup failed:', err.message));
+  }
 });
 
 async function shutdown() {
